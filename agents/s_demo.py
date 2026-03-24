@@ -205,6 +205,8 @@ def agent_loop(messages: list):
         # 否则：执行工具调用
         results = []
         # response.content 是一个 block 列表
+
+        # todo: 更新————循环中按名称查找处理函数
         for block in response.content:
             # 如果这个 block 是工具调用
             if block.type == "tool_use":
@@ -236,7 +238,6 @@ if __name__ == "__main__":
         try:
             # 读取用户输入（带颜色提示）
             query = input("\033[36ms01 >> \033[0m")
-
         except (EOFError, KeyboardInterrupt):
             # Ctrl+D 或 Ctrl+C 退出
             break
