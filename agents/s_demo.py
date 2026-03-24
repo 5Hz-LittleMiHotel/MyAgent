@@ -17,10 +17,74 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-# 系统提示词（格式化字符串：执行 os.getcwd()，然后把结果插进字符串里）
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use bash to solve tasks. Act, don't explain."
+# 系统提示词（告诉LLM使用todo工具来计划多步骤任务。开始前标记in_progress，完成后标记completed）
+SYSTEM = f"""You are a coding agent at {WORKDIR}.
+Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
+Prefer tools over prose."""
 
 
+## ------- TodoManager: structured state the LLM writes to -------
+class TodoManager:
+    def __init__(self):
+        self.items = []
+
+    def update(self, items: list) -> str:
+        # 强调任务列表不能超过 20 项
+        if len(items) > 20:
+            raise ValueError("Max 20 todos allowed")
+        validated = []
+        in_progress_count = 0 # 初始化正在执行的任务的数量
+
+        for i, item in enumerate(items):
+            text = str(item.get("text", "")).strip()
+            status = str(item.get("status", "pending")).lower()
+            item_id = str(item.get("id", str(i + 1)))
+
+            # 每个任务必须包含 text(内容), 不能传一个空任务
+            if not text:
+                raise ValueError(f"Item {item_id}: text required")
+            
+            # 任务状态只能是这三个之一(待办，进行中，已完成)：
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"Item {item_id}: invalid status '{status}'")
+            
+            # 如果 LLM 试图把两个任务都标记为 in_progress, 系统会报ValueError
+            if status == "in_progress":
+                in_progress_count += 1
+            validated.append({"id": item_id, "text": text, "status": status})
+        if in_progress_count > 1:
+            raise ValueError("Only one task can be in_progress at a time")
+        
+        self.items = validated
+
+        # 转换成 ASCII 文本界面
+        return self.render()
+
+    """
+    将内存中的列表对象转换成人类(和LLM)都能直观阅读的 ASCII 文本界面
+    [ ] 代表 pending
+    [>] 代表 in_progress(正在处理)
+    [x] 代表 completed
+    """
+    def render(self) -> str:
+        if not self.items:
+            return "No todos."
+        lines = []
+        for item in self.items:
+            marker = {"pending": "[ ]", 
+                      "in_progress": "[>]",
+                      "completed": "[x]"
+                    }[item["status"]]
+            lines.append(f"{marker} #{item['id']}: {item['text']}")
+        done = sum(1 for t in self.items if t["status"] == "completed")
+        lines.append(f"\n({done}/{len(self.items)} completed)")
+        return "\n".join(lines)
+
+TODO = TodoManager()
+
+
+
+## ---------------- Tool implementations ----------------
 
 # 安全地解析路径，防止越界访问
 def safe_path(p: str) -> Path: # "-> Path" 是类型提示
@@ -35,10 +99,10 @@ def safe_path(p: str) -> Path: # "-> Path" 是类型提示
 def run_bash(command: str) -> str:
     # 定义危险命令（简单黑名单）
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-
     # 如果命令中包含危险内容，直接拒绝执行
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
+    
     try:
         # 执行命令
         r = subprocess.run(
@@ -55,24 +119,22 @@ def run_bash(command: str) -> str:
         return out[:50000] if out else "(no output)"
 
     except subprocess.TimeoutExpired:
-        # 超时保护
-        return "Error: Timeout (120s)"
+        return "Error: Timeout (120s)" # 超时保护
 
 
 
 # 安全地读取文件内容（限制路径、长度）
 def run_read(path: str, limit: int = None) -> str:
-
-    # 先通过 safe_path 确认路径合法，再读取文本内容：
-    text = safe_path(path).read_text() 
-
-    lines = text.splitlines() 
-    # 如果设置了行数限制，并且文件行数超过限制，则只返回前 limit 行：
-    if limit and limit < len(lines): 
-        lines = lines[:limit]
-    
-     # 长度硬限制，将返回的字符串强制截断在 50,000 个字符以内：
-    return "\n".join(lines)[:50000]
+    try:
+        # 先通过 safe_path 确认路径合法，再读取文本内容：
+        lines = safe_path(path).read_text() .splitlines() 
+        # 如果设置了行数限制，并且文件行数超过限制，则只返回前 limit 行, 并告诉LLM还有多少行没给它看：
+        if limit and limit < len(lines): 
+            lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
+        # 长度硬限制，将返回的字符串强制截断在 50,000 个字符以内：
+        return "\n".join(lines)[:50000]
+    except Exception as e:
+        return f"Error: {e}"
 
 
 
@@ -82,7 +144,7 @@ def run_write(path: str, content: str) -> str:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
-        return f"Wrote {len(content)} bytes to {path}"
+        return f"Wrote {len(content)} bytes" # to {path}": 输入参数里已经包含了path。减少 AI 的认知负荷。
     except Exception as e:
         return f"Error: {e}"
 
@@ -111,6 +173,9 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+    {"name": "todo", "description": "Update task list. Track progress on multi-step tasks.",
+     "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}},
+
 ]
 # 上述工具的执行手册：
 # -- The dispatch map: {tool_name: handler} --
@@ -124,14 +189,18 @@ TOOL_HANDLERS = {
     "read_file":  lambda **pkg_read: run_read(pkg_read["path"], pkg_read.get("limit")),
     "write_file": lambda **data_in: run_write(data_in["path"], data_in["content"]),
     "edit_file":  lambda **kw_edit: run_edit(kw_edit["path"], kw_edit["old_text"], kw_edit["new_text"]),
+    "todo":       lambda **kw: TODO.update(kw["items"]),
 }
 
 
 
-# -- 核心 Agent 循环 --
+## ---------------- Agent loop with nag reminder injection ----------------
 def agent_loop(messages: list):
+    rounds_since_todo = 0 # 初始化计数器
+    
     while True:
-        # 调用 LLM（带上下文 + 工具定义）
+
+        # 调用 LLM
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
@@ -146,17 +215,23 @@ def agent_loop(messages: list):
 
         # 否则：执行工具调用
         results = []
-        # response.content 是一个 block 列表
+        used_todo = False
 
-        # todo: 更新————循环中按名称查找处理函数
+        # 循环中按名称查找处理函数
         for block in response.content:
 
             # 如果这个 block 是工具调用
             if block.type == "tool_use":
                 # 去 TOOL_HANDLERS 字典里查找, 返回一个lambda函数的包装
                 handler = TOOL_HANDLERS.get(block.name)
-                # **block.input：AI 提供的参数被解包传入handler。如果工具名不存在(else)，返回错误字符串。
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                
+                # 加入了一个捕获异常的手段
+                try:
+                    # **block.input：AI 提供的参数被解包传入handler。如果工具名不存在(else)，返回错误字符串。
+                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                except Exception as e:
+                    output = f"Error: {e}"
+                
                 # 打印命令与部分输出
                 print(f"> {block.name}: {output[:200]}")
                 # 收集结果
@@ -166,11 +241,20 @@ def agent_loop(messages: list):
                     "content": output
                 })
 
+                if block.name == "todo":
+                    used_todo = True
+
+        # 模型连续 3 轮以上不调用 todo 时注入提醒。
+        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+        if rounds_since_todo >= 3:
+            results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
+        
         # 把工具执行结果作为“用户消息”喂回模型
         messages.append({"role": "user","content": results})
 
 
-# 程序入口
+
+## ---------------- main ----------------
 if __name__ == "__main__":
     history = []
     while True:
@@ -182,10 +266,9 @@ if __name__ == "__main__":
             break
         history.append({"role": "user","content": query}) # 把用户输入加入历史
 
-        # 运行 agent 循环
         agent_loop(history)
 
-        # 取最后一条消息（模型输出）
+        # 取最后一条消息
         response_content = history[-1]["content"]
         # 如果是结构化 block（列表）
         if isinstance(response_content, list):

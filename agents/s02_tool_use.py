@@ -164,9 +164,8 @@ def agent_loop(messages: list):
 
         # 否则：执行工具调用
         results = []
-        # response.content 是一个 block 列表
 
-        # todo: 更新————循环中按名称查找处理函数
+        # 循环中按名称查找处理函数。response.content 是一个 block 列表
         for block in response.content:
 
             # 如果这个 block 是工具调用
