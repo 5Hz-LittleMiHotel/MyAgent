@@ -1,84 +1,38 @@
 #!/usr/bin/env python3
 # Harness: the loop -- the model's first connection to the real world.
-"""
-s01_agent_loop.py - The Agent Loop
 
-The entire secret of an AI coding agent in one pattern:
+import os
+import subprocess
+from pathlib import Path
 
-    while stop_reason == "tool_use":
-        response = LLM(messages, tools)
-        execute tools
-        append results
-
-    +----------+      +-------+      +---------+
-    |   User   | ---> |  LLM  | ---> |  Tool   |
-    |  prompt  |      |       |      | execute |
-    +----------+      +---+---+      +----+----+
-                          ^               |
-                          |   tool_result |
-                          +---------------+
-                          (loop continues)
-
-This is the core loop: feed tool results back to the model
-until the model decides to stop. Production agents layer
-policy, hooks, and lifecycle controls on top.
-"""
-
-
-import os  # 操作系统相关（环境变量、路径等）
-import subprocess  # 用来执行 shell 命令
-
-from anthropic import Anthropic  # Anthropic 官方 SDK
-from dotenv import load_dotenv  # 用于加载 .env 环境变量文件
+from anthropic import Anthropic
+from dotenv import load_dotenv
 
 # 加载当前目录下的 .env 文件（覆盖已有环境变量）
 load_dotenv(override=True)
 
-# 如果设置了自定义 API 地址（例如代理/本地服务）
-if os.getenv("ANTHROPIC_BASE_URL"):
-    # 则移除默认 token（避免冲突）
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
+# 从环境变量中读取模型 ID
+WORKDIR = Path.cwd()
 # 创建 Anthropic 客户端（可连接官方或自定义 endpoint）
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-
-# 从环境变量中读取模型 ID
 MODEL = os.environ["MODEL_ID"]
 
 # 系统提示词（格式化字符串：执行 os.getcwd()，然后把结果插进字符串里）
-SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
-
-# 定义工具
-TOOLS = [{
-    "name": "bash",
-    "description": "Run a shell command.",
-    "input_schema": {  # 输入参数格式（JSON）
-        "type": "object",
-        "properties": {
-            "command": {"type": "string"}  # 要执行的命令
-        },
-        "required": ["command"],  # 必填字段
-    },
-}]
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use bash to solve tasks. Act, don't explain."
 
 
 
 # 安全地解析路径，防止越界访问
 def safe_path(p: str) -> Path: # "-> Path" 是类型提示
     path = (WORKDIR / p).resolve() # pathlib 中的特殊拼接逻辑
-
     # 验证生成的路径是否仍然在 WORKDIR 范围内：
     if not path.is_relative_to(WORKDIR): 
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
 
-
+# 执行 bash 命令的函数, 带有基础安全保护（防止误删系统等）
 def run_bash(command: str) -> str:
-    """
-    执行 bash 命令的函数
-    带有基础安全保护（防止误删系统等）
-    """
     # 定义危险命令（简单黑名单）
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
 
@@ -90,7 +44,7 @@ def run_bash(command: str) -> str:
         r = subprocess.run(
             command,
             shell=True,  # 通过 shell 执行
-            cwd=os.getcwd(),  # 当前工作目录
+            cwd=WORKDIR,  # 当前工作目录
             capture_output=True,  # 捕获 stdout/stderr
             text=True,  # 返回字符串而不是字节
             timeout=120  # 最长执行 120 秒
@@ -176,15 +130,6 @@ TOOL_HANDLERS = {
 
 # -- 核心 Agent 循环 --
 def agent_loop(messages: list):
-    """
-    这是整个 Agent 的核心循环：
-
-    不断：
-    1. 调用 LLM
-    2. 如果 LLM 想用工具 -> 执行
-    3. 把结果喂回去
-    直到 LLM 停止
-    """
     while True:
         # 调用 LLM（带上下文 + 工具定义）
         response = client.messages.create(
@@ -193,10 +138,7 @@ def agent_loop(messages: list):
         )
 
         # 把模型的回复加入对话历史
-        messages.append({
-            "role": "assistant",
-            "content": response.content
-        })
+        messages.append({"role": "assistant","content": response.content})
 
         # 如果模型没有调用工具 -> 结束循环
         if response.stop_reason != "tool_use":
@@ -208,16 +150,16 @@ def agent_loop(messages: list):
 
         # todo: 更新————循环中按名称查找处理函数
         for block in response.content:
+
             # 如果这个 block 是工具调用
             if block.type == "tool_use":
-                # 打印命令（黄色）
-                print(f"\033[33m$ {block.input['command']}\033[0m")
-                # 执行 bash
-                output = run_bash(block.input["command"])
-                # 打印部分输出（防止太长）
-                print(output[:200])
-
-                # 收集结果（返回给模型）
+                # 去 TOOL_HANDLERS 字典里查找, 返回一个lambda函数的包装
+                handler = TOOL_HANDLERS.get(block.name)
+                # **block.input：AI 提供的参数被解包传入handler。如果工具名不存在(else)，返回错误字符串。
+                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                # 打印命令与部分输出
+                print(f"> {block.name}: {output[:200]}")
+                # 收集结果
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,  # 对应 tool_use 的 ID
@@ -225,10 +167,7 @@ def agent_loop(messages: list):
                 })
 
         # 把工具执行结果作为“用户消息”喂回模型
-        messages.append({
-            "role": "user",
-            "content": results
-        })
+        messages.append({"role": "user","content": results})
 
 
 # 程序入口
@@ -236,20 +175,12 @@ if __name__ == "__main__":
     history = []
     while True:
         try:
-            # 读取用户输入（带颜色提示）
             query = input("\033[36ms01 >> \033[0m")
-        except (EOFError, KeyboardInterrupt):
-            # Ctrl+D 或 Ctrl+C 退出
+        except (EOFError, KeyboardInterrupt):             # Ctrl+D 或 Ctrl+C 退出
             break
-        # 输入 q / exit / 空字符串 -> 退出
-        if query.strip().lower() in ("q", "exit", ""):
+        if query.strip().lower() in ("q", "exit", ""):    # q / exit / 空字符串 -> 退出
             break
-
-        # 把用户输入加入历史
-        history.append({
-            "role": "user",
-            "content": query
-        })
+        history.append({"role": "user","content": query}) # 把用户输入加入历史
 
         # 运行 agent 循环
         agent_loop(history)
@@ -259,8 +190,7 @@ if __name__ == "__main__":
         # 如果是结构化 block（列表）
         if isinstance(response_content, list):
             for block in response_content:
-                # 有 text 属性就打印
-                if hasattr(block, "text"):
+                if hasattr(block, "text"): # 有 text 属性就打印
                     print(block.text)
 
         print()  # 空行分隔
