@@ -247,6 +247,7 @@ def agent_loop(messages: list):
         # 模型连续 3 轮以上不调用 todo 时注入提醒。
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         if rounds_since_todo >= 3:
+            # TODO: 这里的逻辑好像有问题，gemini建议修改为results.append
             results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
         
         # 把工具执行结果作为“用户消息”喂回模型
