@@ -42,17 +42,17 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 # 创建 Anthropic 客户端（可连接官方或自定义 endpoint）
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 
-# 从环境变量中读取模型 ID（比如 claude-3）
+# 从环境变量中读取模型 ID
 MODEL = os.environ["MODEL_ID"]
 
-# 系统提示词（告诉模型它是谁、该做什么）
+# 系统提示词（格式化字符串：执行 os.getcwd()，然后把结果插进字符串里）
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
-# 定义工具（这里我们只给模型一个工具：bash）
+# 定义工具
 TOOLS = [{
-    "name": "bash",  # 工具名字
-    "description": "Run a shell command.",  # 工具描述
-    "input_schema": {  # 输入参数格式（JSON Schema）
+    "name": "bash",
+    "description": "Run a shell command.",
+    "input_schema": {  # 输入参数格式（JSON）
         "type": "object",
         "properties": {
             "command": {"type": "string"}  # 要执行的命令
@@ -108,7 +108,6 @@ def agent_loop(messages: list):
     3. 把结果喂回去
     直到 LLM 停止
     """
-    # messages = [{"role": "user", "content": query}]
     while True:
         # 调用 LLM（带上下文 + 工具定义）
         response = client.messages.create(
