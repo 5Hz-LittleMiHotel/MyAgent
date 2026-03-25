@@ -18,8 +18,9 @@ client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
 # 系统提示词（告诉LLM使用todo工具来计划多步骤任务。开始前标记in_progress，完成后标记completed）
-SYSTEM = f"""You are a coding agent at {WORKDIR}.
-Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
+SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings.
+If necessary, use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
 Prefer tools over prose."""
 
 
@@ -103,21 +104,13 @@ def run_bash(command: str) -> str:
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     
-    try:
-        # 执行命令
-        r = subprocess.run(
-            command,
-            shell=True,  # 通过 shell 执行
-            cwd=WORKDIR,  # 当前工作目录
-            capture_output=True,  # 捕获 stdout/stderr
-            text=True,  # 返回字符串而不是字节
-            timeout=120  # 最长执行 120 秒
-        )
+    try: # 执行命令
+        r = subprocess.run(command, shell=True, cwd=WORKDIR, capture_output=True,  # 捕获 stdout/stderr
+                           text=True, timeout=120)
         # 合并标准输出和错误输出
         out = (r.stdout + r.stderr).strip()
         # 限制输出长度（防止爆内存）
         return out[:50000] if out else "(no output)"
-
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)" # 超时保护
 
@@ -165,8 +158,98 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+
+# -- TODO: Subagent: fresh context, filtered tools, summary-only return --
+def run_subagent(prompt: str) -> str:
+    """
+    运行一个“子代理”
+
+    特点：
+    - 有自己独立的上下文 sub_messages
+    - 可以调用工具
+    - 最终只返回“总结结果”给父 agent
+    """
+
+    # 初始化子代理的对话历史（和主 agent 完全隔离）
+    # 这里只放一条用户输入（prompt）
+    sub_messages = [{
+        "role": "user",
+        "content": prompt
+    }]  # fresh context（全新上下文）
+
+    # 限制最多循环 30 次（防止死循环或模型失控）
+    for _ in range(30):  # safety limit
+
+        # 调用 LLM（子代理专用 system prompt + 工具）
+        response = client.messages.create(
+            model=MODEL,
+            system=SUBAGENT_SYSTEM,   # 子代理的系统提示词（通常更专注）
+            messages=sub_messages,   # 子代理自己的历史
+            tools=CHILD_TOOLS,       # 子代理可用工具（通常是子集）
+            max_tokens=8000,
+        )
+
+        # 把模型回复加入子代理历史（assistant 角色）
+        sub_messages.append({
+            "role": "assistant",
+            "content": response.content
+        })
+
+        # 如果模型没有调用工具（说明任务完成 or 不需要工具）
+        # 就退出循环
+        if response.stop_reason != "tool_use":
+            break
+
+        # 用于收集所有工具执行结果
+        results = []
+
+        # 遍历模型返回的 block 列表
+        for block in response.content:
+
+            # 如果是工具调用 block
+            if block.type == "tool_use":
+
+                # 根据工具名找到对应的处理函数
+                handler = TOOL_HANDLERS.get(block.name)
+
+                # 执行工具：
+                # - 如果有 handler，就调用它
+                # - 如果没有，返回错误信息
+                output = (
+                    handler(**block.input)
+                    if handler
+                    else f"Unknown tool: {block.name}"
+                )
+
+                # 把工具执行结果封装成 tool_result
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,  # 对应 tool_use 的 ID
+                    "content": str(output)[:50000]  # 限制输出长度
+                })
+
+        # 把工具结果作为“用户消息”喂回模型（继续循环）
+        sub_messages.append({
+            "role": "user",
+            "content": results
+        })
+
+    # ---------------------------
+    # 循环结束：返回结果给父 agent
+    # ---------------------------
+
+    # 从最后一次 response 中提取所有 text block
+    # 并拼接成一个字符串
+    return "".join(
+        b.text for b in response.content
+        if hasattr(b, "text")  # 只取 text 类型 block
+    ) or "(no summary)"  # 如果没有文本，就返回默认值
+
+
+
 # 工具列表（定义工具的名称、描述和输入格式）。模型会根据这个列表来决定调用哪个工具，以及如何构造输入参数。
-TOOLS = [
+
+CHILD_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
@@ -177,7 +260,10 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "todo", "description": "Update task list. Track progress on multi-step tasks.",
      "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}},
-
+]
+PARENT_TOOLS = CHILD_TOOLS + [
+    {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+     "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
 ]
 # -- The dispatch map: {tool_name: handler} --
 """
@@ -196,6 +282,7 @@ TOOL_HANDLERS = {
 
 
 ## ---------------- Agent loop with nag reminder injection ----------------
+# TODO: 既然不是所有的智能体都需要todo工具了，需要对agent_loop进行改造
 def agent_loop(messages: list):
     rounds_since_todo = 0 # 初始化计数器
     
@@ -248,17 +335,6 @@ def agent_loop(messages: list):
         # 模型连续 3 轮以上不调用 todo 时注入提醒。
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         if rounds_since_todo >= 3:
-            """
-            模型优先响应 reminder, 而忽略结果, 造成任务流被打断.
-            模型很容易变成："Sure, let me update the todo...";  而不是："根据刚刚的文件，接下来要……".
-            正确链条应该是：          action → observation → reasoning → next action
-            insert(0,...)就变成了:   interrupt → observation → confusion → wrong action
-
-            如果确实使用insert, 可能会报错: 
-            `tool_use` ids were found without `tool_result` blocks immediately after
-            这是Anthropic 的规则, tool_use 后必须紧跟 tool_result
-            """
-            # results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
             results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
         
         # 把工具执行结果作为“用户消息”喂回模型
