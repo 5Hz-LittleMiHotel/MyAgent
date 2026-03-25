@@ -84,7 +84,7 @@ TODO = TodoManager()
 
 
 
-## ---------------- Tool implementations ----------------
+## ---------------------- sandbox ----------------------
 
 # 安全地解析路径，防止越界访问
 def safe_path(p: str) -> Path: # "-> Path" 是类型提示
@@ -122,6 +122,8 @@ def run_bash(command: str) -> str:
         return "Error: Timeout (120s)" # 超时保护
 
 
+
+## ---------------- Tool implementations ----------------
 
 # 安全地读取文件内容（限制路径、长度）
 def run_read(path: str, limit: int = None) -> str:
@@ -177,12 +179,11 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}},
 
 ]
-# 上述工具的执行手册：
 # -- The dispatch map: {tool_name: handler} --
 """
 分发器模式的字典直接把指令名作为键(Key),把处理逻辑作为值(Value)。
 当你收到一个任务时,去kw变量里找 path 和 limit ，然后交给 run_read 。为了便于理解,我给kw都改了改。
-每个 lambda 都是一个独立的小世界(匿名函数)。所以假如全用kw也没问题。
+每个 lambda 都是一个独立的匿名函数。所以假如全用kw也没问题。
 """
 TOOL_HANDLERS = {
     "bash":       lambda **kw_bash: run_bash(kw_bash["command"]),
@@ -247,8 +248,18 @@ def agent_loop(messages: list):
         # 模型连续 3 轮以上不调用 todo 时注入提醒。
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         if rounds_since_todo >= 3:
-            # TODO: 这里的逻辑好像有问题，gemini建议修改为results.append
-            results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
+            """
+            模型优先响应 reminder, 而忽略结果, 造成任务流被打断.
+            模型很容易变成："Sure, let me update the todo...";  而不是："根据刚刚的文件，接下来要……".
+            正确链条应该是：          action → observation → reasoning → next action
+            insert(0,...)就变成了:   interrupt → observation → confusion → wrong action
+
+            如果确实使用insert, 可能会报错: 
+            `tool_use` ids were found without `tool_result` blocks immediately after
+            这是Anthropic 的规则, tool_use 后必须紧跟 tool_result
+            """
+            # results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
+            results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
         
         # 把工具执行结果作为“用户消息”喂回模型
         messages.append({"role": "user","content": results})
