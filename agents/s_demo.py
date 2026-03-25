@@ -18,13 +18,13 @@ client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
 # 系统提示词（告诉LLM使用todo工具来计划多步骤任务。开始前标记in_progress，完成后标记completed）
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
-SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings.
+SYSTEM = f"""You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks.
 If necessary, use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
 Prefer tools over prose."""
+SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."""
 
 
-## ------- TodoManager: structured state the LLM writes to -------
+# %% ------- TodoManager: structured state the LLM writes to -------
 class TodoManager:
     def __init__(self):
         self.items = []
@@ -85,7 +85,7 @@ TODO = TodoManager()
 
 
 
-## ---------------------- sandbox ----------------------
+# %% ---------------------- sandbox ----------------------
 
 # 安全地解析路径，防止越界访问
 def safe_path(p: str) -> Path: # "-> Path" 是类型提示
@@ -105,7 +105,8 @@ def run_bash(command: str) -> str:
         return "Error: Dangerous command blocked"
     
     try: # 执行命令
-        r = subprocess.run(command, shell=True, cwd=WORKDIR, capture_output=True,  # 捕获 stdout/stderr
+        r = subprocess.run(command, shell=True, cwd=WORKDIR, 
+                           capture_output=True,  # 捕获 stdout/stderr
                            text=True, timeout=120)
         # 合并标准输出和错误输出
         out = (r.stdout + r.stderr).strip()
@@ -116,7 +117,7 @@ def run_bash(command: str) -> str:
 
 
 
-## ---------------- Tool implementations ----------------
+# %% ---------------- Tool implementations ----------------
 
 # 安全地读取文件内容（限制路径、长度）
 def run_read(path: str, limit: int = None) -> str:
@@ -160,6 +161,11 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 # -- TODO: Subagent: fresh context, filtered tools, summary-only return --
+def handle_task(prompt: str, description: str = "subtask") -> str:
+    print(f"> task ({description}): {prompt[:80]}")
+    output = run_subagent(prompt)
+    return output
+
 def run_subagent(prompt: str) -> str:
     """
     运行一个“子代理”
@@ -210,7 +216,7 @@ def run_subagent(prompt: str) -> str:
             if block.type == "tool_use":
 
                 # 根据工具名找到对应的处理函数
-                handler = TOOL_HANDLERS.get(block.name)
+                handler = CHILD_TOOL_HANDLERS.get(block.name)
 
                 # 执行工具：
                 # - 如果有 handler，就调用它
@@ -258,10 +264,10 @@ CHILD_TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "todo", "description": "Update task list. Track progress on multi-step tasks.",
-     "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}},
 ]
 PARENT_TOOLS = CHILD_TOOLS + [
+    {"name": "todo", "description": "Update task list. Track progress on multi-step tasks.",
+     "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}},
     {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
      "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
 ]
@@ -271,17 +277,20 @@ PARENT_TOOLS = CHILD_TOOLS + [
 当你收到一个任务时,去kw变量里找 path 和 limit ，然后交给 run_read 。为了便于理解,我给kw都改了改。
 每个 lambda 都是一个独立的匿名函数。所以假如全用kw也没问题。
 """
-TOOL_HANDLERS = {
+CHILD_TOOL_HANDLERS = {
     "bash":       lambda **kw_bash: run_bash(kw_bash["command"]),
     "read_file":  lambda **pkg_read: run_read(pkg_read["path"], pkg_read.get("limit")),
     "write_file": lambda **data_in: run_write(data_in["path"], data_in["content"]),
     "edit_file":  lambda **kw_edit: run_edit(kw_edit["path"], kw_edit["old_text"], kw_edit["new_text"]),
+}
+PARENT_TOOLS_HANDLERS = {
+    **CHILD_TOOL_HANDLERS,
     "todo":       lambda **kw: TODO.update(kw["items"]),
+    "task":       lambda **kw: handle_task(kw["prompt"], kw.get("description", "subtask")),
 }
 
 
-
-## ---------------- Agent loop with nag reminder injection ----------------
+# %% ---------------- Agent loop with nag reminder injection ----------------
 # TODO: 既然不是所有的智能体都需要todo工具了，需要对agent_loop进行改造
 def agent_loop(messages: list):
     rounds_since_todo = 0 # 初始化计数器
@@ -291,7 +300,7 @@ def agent_loop(messages: list):
         # 调用 LLM
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+            tools=PARENT_TOOLS, max_tokens=8000,
         )
 
         # 把模型的回复加入对话历史
@@ -311,7 +320,7 @@ def agent_loop(messages: list):
             # 如果这个 block 是工具调用
             if block.type == "tool_use":
                 # 去 TOOL_HANDLERS 字典里查找, 返回一个lambda函数的包装
-                handler = TOOL_HANDLERS.get(block.name)
+                handler = PARENT_TOOLS_HANDLERS.get(block.name)
                 
                 # 加入了一个捕获异常的手段
                 try:
@@ -342,7 +351,7 @@ def agent_loop(messages: list):
 
 
 
-## ---------------- main ----------------
+# %% ---------------- main ----------------
 if __name__ == "__main__":
     history = []
     while True:
