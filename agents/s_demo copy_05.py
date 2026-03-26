@@ -20,10 +20,10 @@ SKILLS_DIR = WORKDIR / "skills"
 # %% -- SkillLoader: scan skills/<name>/SKILL.md with YAML frontmatter --
 class SkillLoader:
     def __init__(self, skills_dir: Path):
-        # skills_dir: 技能目录路径（例如 ./skills）
+        # skills_dir: 技能目录路径(例如 ./skills)
         self.skills_dir = skills_dir
 
-        # 存储所有加载后的技能：
+        # 存储所有加载后的技能: 
         # {
         #   "skill_name": {
         #       "meta": {...},   # frontmatter 元数据
@@ -37,7 +37,7 @@ class SkillLoader:
         self._load_all()
 
     def _load_all(self):
-        # 如果技能目录不存在，直接返回（避免报错）
+        # 如果技能目录不存在, 直接返回(避免报错)
         if not self.skills_dir.exists():
             return
 
@@ -47,11 +47,11 @@ class SkillLoader:
             # 读取文件内容
             text = f.read_text()
 
-            # 解析 frontmatter（元信息）和正文
+            # 解析 frontmatter(元信息)和正文
             meta, body = self._parse_frontmatter(text)
 
             # 技能名称优先取 meta 中的 name
-            # 如果没有，则使用文件所在目录名
+            # 如果没有, 则使用文件所在目录名
             name = meta.get("name", f.parent.name)
 
             # 存入 skills 字典
@@ -65,7 +65,7 @@ class SkillLoader:
         """
         解析 Markdown 文件中的 frontmatter(YAML 风格元数据)
 
-        格式示例：
+        格式示例: 
         ---
         name: git_commit
         description: Rules for writing commit messages
@@ -74,39 +74,39 @@ class SkillLoader:
         这里是正文内容...
         """
 
-        # 使用正则匹配 frontmatter（--- 包裹的部分）
+        # 使用正则匹配 frontmatter(--- 包裹的部分)
         match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
 
-        # 如果没有 frontmatter，返回空 meta + 全部文本作为正文
+        # 如果没有 frontmatter, 返回空 meta + 全部文本作为正文
         if not match:
             return {}, text
 
         meta = {}
 
-        # 逐行解析 YAML（简化版，只支持 key: value）
+        # 逐行解析 YAML(简化版, 只支持 key: value)
         for line in match.group(1).strip().splitlines():
             if ":" in line:
                 key, val = line.split(":", 1)
                 meta[key.strip()] = val.strip()
 
-        # 返回：
-        # - meta（字典）
-        # - body（去掉 frontmatter 后的正文）
+        # 返回: 
+        # - meta(字典)
+        # - body(去掉 frontmatter 后的正文)
         return meta, match.group(2).strip()
 
     def get_descriptions(self) -> str:
         """
-        Layer 1: 提供“技能摘要”，用于 system prompt
+        Layer 1: 提供“技能摘要”, 用于 system prompt
 
-        只返回：
+        只返回: 
         - 名称
         - 简短描述
         - tags(可选)
 
-        目的：让模型知道“有哪些技能可用”，但不占太多 token
+        目的: 让模型知道“有哪些技能可用”, 但不占太多 token
         """
 
-        # 如果没有技能，返回占位信息
+        # 如果没有技能, 返回占位信息
         if not self.skills:
             return "(no skills available)"
 
@@ -117,39 +117,39 @@ class SkillLoader:
             # description 用于简要说明技能用途
             desc = skill["meta"].get("description", "No description")
 
-            # tags 用于辅助检索（例如：git, testing）
+            # tags 用于辅助检索(例如: git, testing)
             tags = skill["meta"].get("tags", "")
 
             # 构造一行描述
             line = f"  - {name}: {desc}"
 
-            # 如果有 tags，则附加
+            # 如果有 tags, 则附加
             if tags:
                 line += f" [{tags}]"
 
             lines.append(line)
 
-        # 多行拼接为字符串（供 system prompt 使用）
+        # 多行拼接为字符串(供 system prompt 使用)
         return "\n".join(lines)
 
     def get_content(self, name: str) -> str:
         """
-        Layer 2: 返回完整技能内容（用于 tool_result 注入）
+        Layer 2: 返回完整技能内容(用于 tool_result 注入)
 
         👉 只有在模型明确请求某个 skill 时才调用
-        👉 避免把所有技能塞进 prompt（节省 token）
+        👉 避免把所有技能塞进 prompt(节省 token)
         """
 
-        # 查找对应技能, 如果不存在, 返回错误 + 可用技能列表（帮助模型纠错）
+        # 查找对应技能, 如果不存在, 返回错误 + 可用技能列表(帮助模型纠错)
         skill = self.skills.get(name)
         if not skill:
             return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
 
-        # 返回结构化内容（用 XML-like 包裹，方便模型解析）
+        # 返回结构化内容(用 XML-like 包裹, 方便模型解析)
         return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
 
 
-# 全局实例（通常在程序启动时初始化一次）
+# 全局实例(通常在程序启动时初始化一次)
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
 
 
@@ -217,7 +217,7 @@ TODO = TodoManager()
 
 # %% ---------------------- sandbox ----------------------
 
-# 安全地解析路径，防止越界访问
+# 安全地解析路径, 防止越界访问
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR): 
@@ -245,12 +245,12 @@ def run_bash(command: str) -> str:
 # 安全地读取文件内容
 def run_read(path: str, limit: int = None) -> str:
     try:
-        # 先通过 safe_path 确认路径合法，再读取文本内容：
+        # 先通过 safe_path 确认路径合法, 再读取文本内容: 
         lines = safe_path(path).read_text() .splitlines() 
-        # 如文件行数超过限制，则只返回前 limit 行, 并告诉LLM还有多少行没给它看：
+        # 如文件行数超过限制, 则只返回前 limit 行, 并告诉LLM还有多少行没给它看: 
         if limit and limit < len(lines): 
             lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
-        # 长度硬限制，将返回的字符串强制截断在 50,000 个字符以内：
+        # 长度硬限制, 将返回的字符串强制截断在 50,000 个字符以内: 
         return "\n".join(lines)[:50000]
     except Exception as e:
         return f"Error: {e}"
@@ -267,7 +267,7 @@ def run_write(path: str, content: str) -> str:
         return f"Error: {e}"
 
 
-# 安全地编辑文件内容（限制路径）
+# 安全地编辑文件内容(限制路径)
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
         fp = safe_path(path)
@@ -288,29 +288,29 @@ def handle_task(prompt: str, description: str = "subtask") -> str:
     return output
 
 def run_subagent(prompt: str) -> str:
-    # 初始化子代理的对话历史（和主 agent 完全隔离）
-    # 这里只放一条用户输入（prompt）
+    # 初始化子代理的对话历史(和主 agent 完全隔离)
+    # 这里只放一条用户输入(prompt)
     sub_messages = [{
         "role": "user",
         "content": prompt
-    }]  # fresh context（全新上下文）
+    }]  # fresh context(全新上下文)
 
-    # 限制最多循环 30 次（防止死循环或模型失控）
+    # 限制最多循环 30 次(防止死循环或模型失控)
     for _ in range(30):  # safety limit
-        # 调用 LLM（子代理专用 system prompt + 工具）
+        # 调用 LLM(子代理专用 system prompt + 工具)
         response = client.messages.create(
             model=MODEL,
-            system=SUBAGENT_SYSTEM,   # 子代理的系统提示词（通常更专注）
+            system=SUBAGENT_SYSTEM,   # 子代理的系统提示词(通常更专注)
             messages=sub_messages,   # 子代理自己的历史
-            tools=CHILD_TOOLS,       # 子代理可用工具（是父子集）
+            tools=CHILD_TOOLS,       # 子代理可用工具(是父子集)
             max_tokens=8000,
         )
-        # 把模型回复加入子代理历史（assistant 角色）
+        # 把模型回复加入子代理历史(assistant 角色)
         sub_messages.append({
             "role": "assistant",
             "content": response.content
         })
-        # 如果模型没有调用工具（说明任务完成 or 不需要工具）就退出循环
+        # 如果模型没有调用工具(说明任务完成 or 不需要工具)就退出循环
         if response.stop_reason != "tool_use":
             break
         results = []
@@ -320,9 +320,9 @@ def run_subagent(prompt: str) -> str:
             if block.type == "tool_use":
                 # 根据工具名找到对应的处理函数
                 handler = CHILD_TOOL_HANDLERS.get(block.name)
-                # 执行工具：
-                # - 如果有 handler，就调用它
-                # - 如果没有，返回错误信息
+                # 执行工具: 
+                # - 如果有 handler, 就调用它
+                # - 如果没有, 返回错误信息
                 output = (
                     handler(**block.input)
                     if handler
@@ -334,22 +334,22 @@ def run_subagent(prompt: str) -> str:
                     "tool_use_id": block.id,  # 对应 tool_use 的 ID
                     "content": str(output)[:50000]  # 限制输出长度
                 })
-        # 把工具结果作为“用户消息”喂回模型（继续循环）
+        # 把工具结果作为“用户消息”喂回模型(继续循环)
         sub_messages.append({
             "role": "user",
             "content": results
         })
 
-    # 循环结束：返回结果给父 agent
+    # 循环结束: 返回结果给父 agent
     # 从最后一次 response 中提取所有 text block 并拼接
     return "".join(
         b.text for b in response.content
         if hasattr(b, "text")  # 只取 text 类型 block
-    ) or "(no summary)"  # 如果没有文本，就返回默认值
+    ) or "(no summary)"  # 如果没有文本, 就返回默认值
 
 
 
-# 工具列表（定义工具的名称、描述和输入格式）。模型会根据这个列表来决定调用哪个工具，以及如何构造输入参数。
+# 工具列表(定义工具的名称、描述和输入格式)。模型会根据这个列表来决定调用哪个工具, 以及如何构造输入参数。
 CHILD_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -399,7 +399,7 @@ def agent_loop(messages: list):
         # 如果模型没有调用工具 -> 结束循环
         if response.stop_reason != "tool_use":
             return
-        # 否则：执行工具调用
+        # 否则: 执行工具调用
         results = []
         used_todo = False
 
@@ -410,7 +410,7 @@ def agent_loop(messages: list):
                 # 去 TOOL_HANDLERS 字典里查找, 返回一个lambda函数的包装
                 handler = PARENT_TOOLS_HANDLERS.get(block.name)
                 try:
-                    # **block.input：AI 提供的参数被解包传入handler。如果工具名不存在(else)，返回错误字符串。
+                    # **block.input: AI 提供的参数被解包传入handler。如果工具名不存在(else), 返回错误字符串。
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
@@ -452,10 +452,45 @@ if __name__ == "__main__":
         agent_loop(history)
 
         response_content = history[-1]["content"]
-        # 如果是结构化 block（列表）
+        # 如果是结构化 block(列表)
         if isinstance(response_content, list):
             for block in response_content:
                 if hasattr(block, "text"): # 有 text 属性就打印
                     print(block.text)
 
         print()  # 空行分隔
+
+"""
+现在有一个问题: 
+设置了一个SkillLoader类用于从skills目录加载工具, 并设置两层加载, Layer 1: 摘要, Layer 2: 按需加载全文。
+一旦设置这个两层加载机制, 好像s04的一些代码就显得冗余了。
+
+第一个agent-builder的SKILL.md包含的提示词内容已简化, 下面是该md文件提供的资源: 
+## Resources
+
+**Philosophy & Theory**:
+- `references/agent-philosophy.md` - Deep dive into why agents work
+
+**Implementation**:
+- `references/minimal-agent.py` - Complete working agent (~80 lines)
+- `references/tool-templates.py` - Capability definitions
+- `references/subagent-pattern.py` - Context isolation
+
+**Scaffolding**:
+- `scripts/init_agent.py` - Generate new agent projects
+
+
+第二个code-review的SKILL.md包含的提示词内容已简化: 
+只有当用户提到‘审查’、‘Bug’、‘安全’这些词时，才需要激活这个模式。包含的内容大概有：
+Node.js	npm audit	检查 package.json 依赖的安全漏洞
+Python	pip-audit	检查 Python 依赖的安全漏洞
+Rust	cargo audit	检查 Rust crate 依赖的安全漏洞
+
+当读到第三个 mcp-builder 的 SKILL.md ，智能体将会做：
+依据此文件编写Python或TypeScript代码，构建独立的MCP服务器以集成外部API、数据库或本地资源。
+它会定义工具函数、配置启动命令，并指导用户将其注册到配置文件中，从而动态扩展自身能力以执行特定任务。
+
+第四个 pdf 的 SKILL.md ：
+该文件定义了PDF处理技能，涵盖读取、创建、合并及拆分等操作，并推荐了PyMuPDF等库。
+Agent读到后，将依据用户指令调用相应工具或代码，执行如提取文本、生成报告或整理文档等具体任务。
+"""
