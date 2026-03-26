@@ -140,10 +140,8 @@ class SkillLoader:
         👉 避免把所有技能塞进 prompt（节省 token）
         """
 
-        # 查找对应技能
+        # 查找对应技能, 如果不存在, 返回错误 + 可用技能列表（帮助模型纠错）
         skill = self.skills.get(name)
-
-        # 如果不存在，返回错误 + 可用技能列表（帮助模型纠错）
         if not skill:
             return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
 

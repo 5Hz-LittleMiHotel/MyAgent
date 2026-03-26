@@ -33,16 +33,16 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-# 加载当前目录下的 .env 文件（覆盖已有环境变量）
+# 加载当前目录下的 .env 文件(覆盖已有环境变量)
 load_dotenv(override=True)
 
 # 从环境变量中读取模型 ID
 WORKDIR = Path.cwd()
-# 创建 Anthropic 客户端（可连接官方或自定义 endpoint）
+# 创建 Anthropic 客户端(可连接官方或自定义 endpoint)
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-# 系统提示词（告诉LLM使用todo工具来计划多步骤任务。开始前标记in_progress，完成后标记completed）
+# 系统提示词(告诉LLM使用todo工具来计划多步骤任务。开始前标记in_progress, 完成后标记completed)
 SYSTEM = f"""You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks.
 If necessary, use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
 Prefer tools over prose."""
@@ -70,7 +70,7 @@ class TodoManager:
             if not text:
                 raise ValueError(f"Item {item_id}: text required")
             
-            # 任务状态只能是这三个之一(待办，进行中，已完成)：
+            # 任务状态只能是这三个之一(待办, 进行中, 已完成): 
             if status not in ("pending", "in_progress", "completed"):
                 raise ValueError(f"Item {item_id}: invalid status '{status}'")
             
@@ -112,20 +112,20 @@ TODO = TodoManager()
 
 # %% ---------------------- sandbox ----------------------
 
-# 安全地解析路径，防止越界访问
+# 安全地解析路径, 防止越界访问
 def safe_path(p: str) -> Path: # "-> Path" 是类型提示
     path = (WORKDIR / p).resolve() # pathlib 中的特殊拼接逻辑
-    # 验证生成的路径是否仍然在 WORKDIR 范围内：
+    # 验证生成的路径是否仍然在 WORKDIR 范围内: 
     if not path.is_relative_to(WORKDIR): 
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
 
-# 执行 bash 命令的函数, 带有基础安全保护（防止误删系统等）
+# 执行 bash 命令的函数, 带有基础安全保护(防止误删系统等)
 def run_bash(command: str) -> str:
-    # 定义危险命令（简单黑名单）
+    # 定义危险命令(简单黑名单)
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    # 如果命令中包含危险内容，直接拒绝执行
+    # 如果命令中包含危险内容, 直接拒绝执行
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     
@@ -135,7 +135,7 @@ def run_bash(command: str) -> str:
                            text=True, timeout=120)
         # 合并标准输出和错误输出
         out = (r.stdout + r.stderr).strip()
-        # 限制输出长度（防止爆内存）
+        # 限制输出长度(防止爆内存)
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)" # 超时保护
@@ -144,22 +144,22 @@ def run_bash(command: str) -> str:
 
 # %% ---------------- Tool implementations ----------------
 
-# 安全地读取文件内容（限制路径、长度）
+# 安全地读取文件内容(限制路径、长度)
 def run_read(path: str, limit: int = None) -> str:
     try:
-        # 先通过 safe_path 确认路径合法，再读取文本内容：
+        # 先通过 safe_path 确认路径合法, 再读取文本内容: 
         lines = safe_path(path).read_text() .splitlines() 
-        # 如果设置了行数限制，并且文件行数超过限制，则只返回前 limit 行, 并告诉LLM还有多少行没给它看：
+        # 如果设置了行数限制, 并且文件行数超过限制, 则只返回前 limit 行, 并告诉LLM还有多少行没给它看: 
         if limit and limit < len(lines): 
             lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
-        # 长度硬限制，将返回的字符串强制截断在 50,000 个字符以内：
+        # 长度硬限制, 将返回的字符串强制截断在 50,000 个字符以内: 
         return "\n".join(lines)[:50000]
     except Exception as e:
         return f"Error: {e}"
 
 
 
-# 安全地写入文件内容（限制路径）
+# 安全地写入文件内容(限制路径)
 def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
@@ -171,7 +171,7 @@ def run_write(path: str, content: str) -> str:
 
 
 
-# 安全地编辑文件内容（限制路径）
+# 安全地编辑文件内容(限制路径)
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
         fp = safe_path(path)
@@ -195,38 +195,38 @@ def run_subagent(prompt: str) -> str:
     """
     运行一个“子代理”
 
-    特点：
+    特点: 
     - 有自己独立的上下文 sub_messages
     - 可以调用工具
     - 最终只返回“总结结果”给父 agent
     """
 
-    # 初始化子代理的对话历史（和主 agent 完全隔离）
-    # 这里只放一条用户输入（prompt）
+    # 初始化子代理的对话历史(和主 agent 完全隔离)
+    # 这里只放一条用户输入(prompt)
     sub_messages = [{
         "role": "user",
         "content": prompt
-    }]  # fresh context（全新上下文）
+    }]  # fresh context(全新上下文)
 
-    # 限制最多循环 30 次（防止死循环或模型失控）
+    # 限制最多循环 30 次(防止死循环或模型失控)
     for _ in range(30):  # safety limit
 
-        # 调用 LLM（子代理专用 system prompt + 工具）
+        # 调用 LLM(子代理专用 system prompt + 工具)
         response = client.messages.create(
             model=MODEL,
-            system=SUBAGENT_SYSTEM,   # 子代理的系统提示词（通常更专注）
+            system=SUBAGENT_SYSTEM,   # 子代理的系统提示词(通常更专注)
             messages=sub_messages,   # 子代理自己的历史
-            tools=CHILD_TOOLS,       # 子代理可用工具（通常是子集）
+            tools=CHILD_TOOLS,       # 子代理可用工具(通常是子集)
             max_tokens=8000,
         )
 
-        # 把模型回复加入子代理历史（assistant 角色）
+        # 把模型回复加入子代理历史(assistant 角色)
         sub_messages.append({
             "role": "assistant",
             "content": response.content
         })
 
-        # 如果模型没有调用工具（说明任务完成 or 不需要工具）
+        # 如果模型没有调用工具(说明任务完成 or 不需要工具)
         # 就退出循环
         if response.stop_reason != "tool_use":
             break
@@ -243,9 +243,9 @@ def run_subagent(prompt: str) -> str:
                 # 根据工具名找到对应的处理函数
                 handler = CHILD_TOOL_HANDLERS.get(block.name)
 
-                # 执行工具：
-                # - 如果有 handler，就调用它
-                # - 如果没有，返回错误信息
+                # 执行工具: 
+                # - 如果有 handler, 就调用它
+                # - 如果没有, 返回错误信息
                 output = (
                     handler(**block.input)
                     if handler
@@ -259,14 +259,14 @@ def run_subagent(prompt: str) -> str:
                     "content": str(output)[:50000]  # 限制输出长度
                 })
 
-        # 把工具结果作为“用户消息”喂回模型（继续循环）
+        # 把工具结果作为“用户消息”喂回模型(继续循环)
         sub_messages.append({
             "role": "user",
             "content": results
         })
 
     # ---------------------------
-    # 循环结束：返回结果给父 agent
+    # 循环结束: 返回结果给父 agent
     # ---------------------------
 
     # 从最后一次 response 中提取所有 text block
@@ -274,11 +274,11 @@ def run_subagent(prompt: str) -> str:
     return "".join(
         b.text for b in response.content
         if hasattr(b, "text")  # 只取 text 类型 block
-    ) or "(no summary)"  # 如果没有文本，就返回默认值
+    ) or "(no summary)"  # 如果没有文本, 就返回默认值
 
 
 
-# 工具列表（定义工具的名称、描述和输入格式）。模型会根据这个列表来决定调用哪个工具，以及如何构造输入参数。
+# 工具列表(定义工具的名称、描述和输入格式)。模型会根据这个列表来决定调用哪个工具, 以及如何构造输入参数。
 
 CHILD_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -299,7 +299,7 @@ PARENT_TOOLS = CHILD_TOOLS + [
 # -- The dispatch map: {tool_name: handler} --
 """
 分发器模式的字典直接把指令名作为键(Key),把处理逻辑作为值(Value)。
-当你收到一个任务时,去kw变量里找 path 和 limit ，然后交给 run_read 。为了便于理解,我给kw都改了改。
+当你收到一个任务时,去kw变量里找 path 和 limit , 然后交给 run_read 。为了便于理解,我给kw都改了改。
 每个 lambda 都是一个独立的匿名函数。所以假如全用kw也没问题。
 """
 CHILD_TOOL_HANDLERS = {
@@ -316,7 +316,7 @@ PARENT_TOOLS_HANDLERS = {
 
 
 # %% ---------------- Agent loop with nag reminder injection ----------------
-# TODO: 既然不是所有的智能体都需要todo工具了，需要对agent_loop进行改造
+# TODO: 既然不是所有的智能体都需要todo工具了, 需要对agent_loop进行改造
 def agent_loop(messages: list):
     rounds_since_todo = 0 # 初始化计数器
     
@@ -335,7 +335,7 @@ def agent_loop(messages: list):
         if response.stop_reason != "tool_use":
             return
 
-        # 否则：执行工具调用
+        # 否则: 执行工具调用
         results = []
         used_todo = False
 
@@ -349,7 +349,7 @@ def agent_loop(messages: list):
                 
                 # 加入了一个捕获异常的手段
                 try:
-                    # **block.input：AI 提供的参数被解包传入handler。如果工具名不存在(else)，返回错误字符串。
+                    # **block.input: AI 提供的参数被解包传入handler。如果工具名不存在(else), 返回错误字符串。
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
@@ -392,10 +392,23 @@ if __name__ == "__main__":
 
         # 取最后一条消息
         response_content = history[-1]["content"]
-        # 如果是结构化 block（列表）
+        # 如果是结构化 block(列表)
         if isinstance(response_content, list):
             for block in response_content:
                 if hasattr(block, "text"): # 有 text 属性就打印
                     print(block.text)
 
         print()  # 空行分隔
+
+"""
+目前整个智能体的py代码包括以下几个核心点: 
+1.TodoManager类包括两个方法, update方法用于更新任务(带校验), render方法用于将任务完成度转成可读文本。
+2.设置了安全沙箱, safe_path(p)函数防止路径越界；run_bash(command)函数带安全限制地执行 shell 命令。
+3.设置了文件操作工具, run_read(path, limit)、run_write(path, content)、run_edit(path, old, new)。
+4.此外设置了子代理系统, handle_task(prompt)函数用于对外接口, 即启动子任务；run_subagent(prompt)用于真正执行子代理。
+5.设置了两个工具系统, 其一是子代理工具系统: CHILD_TOOLS限定了子代理可用工具(bash、read_file、write_file、edit_file), PARENT_TOOLS在子代理基础上, 附加了一些额外能力: todo(任务管理)、task(管理调用子代理)和load_skill(知识加载)。
+6.最后是设置的agent loop: 
+用户输入 → agent_loop → LLM决策(是否调用工具)
+        → 执行工具 → 把结果喂回LLM
+        → 循环直到结束
+"""
