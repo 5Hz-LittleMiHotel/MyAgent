@@ -222,9 +222,9 @@ if __name__ == "__main__":
 
 # .env.example 模板，创建项目时自动生成，用户按需填写真实 Key
 ENV_TEMPLATE = '''# API Configuration
-ANTHROPIC_API_KEY=sk-xxx
-ANTHROPIC_BASE_URL=https://api.anthropic.com
-MODEL_NAME=claude-sonnet-4-20250514
+ANTHROPIC_API_KEY=sk-43eaf3c517974fcfb8c79de7e5055c2b
+ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+MODEL_NAME=deepseek-chat
 '''
 
 

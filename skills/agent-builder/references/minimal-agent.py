@@ -22,7 +22,7 @@ import os                         # 导入 os 模块，用于读取环境变量
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 # 模型名称，优先读取环境变量，未设置则使用默认值
-MODEL = os.getenv("MODEL_NAME", "claude-sonnet-4-20250514")
+MODEL = os.getenv("MODEL_NAME", "deepseek-chat")
 
 # 工作目录，默认为当前目录（脚本运行所在目录）
 WORKDIR = Path.cwd()

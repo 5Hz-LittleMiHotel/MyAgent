@@ -281,76 +281,8 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 
-# -- TODO: Subagent: fresh context, filtered tools, summary-only return --
-def handle_task(prompt: str, description: str = "subtask") -> str:
-    print(f"> task ({description}): {prompt[:80]}")
-    output = run_subagent(prompt)
-    return output
-
-def run_subagent(prompt: str) -> str:
-    # 初始化子代理的对话历史(和主 agent 完全隔离)
-    # 这里只放一条用户输入(prompt)
-    sub_messages = [{
-        "role": "user",
-        "content": prompt
-    }]  # fresh context(全新上下文)
-
-    # 限制最多循环 30 次(防止死循环或模型失控)
-    for _ in range(30):  # safety limit
-        # 调用 LLM(子代理专用 system prompt + 工具)
-        response = client.messages.create(
-            model=MODEL,
-            system=SUBAGENT_SYSTEM,   # 子代理的系统提示词(通常更专注)
-            messages=sub_messages,   # 子代理自己的历史
-            tools=CHILD_TOOLS,       # 子代理可用工具(是父子集)
-            max_tokens=8000,
-        )
-        # 把模型回复加入子代理历史(assistant 角色)
-        sub_messages.append({
-            "role": "assistant",
-            "content": response.content
-        })
-        # 如果模型没有调用工具(说明任务完成 or 不需要工具)就退出循环
-        if response.stop_reason != "tool_use":
-            break
-        results = []
-        # 遍历模型返回的 block 列表
-        for block in response.content:
-            # 如果是工具调用 block
-            if block.type == "tool_use":
-                # 根据工具名找到对应的处理函数
-                handler = CHILD_TOOL_HANDLERS.get(block.name)
-                # 执行工具: 
-                # - 如果有 handler, 就调用它
-                # - 如果没有, 返回错误信息
-                output = (
-                    handler(**block.input)
-                    if handler
-                    else f"Unknown tool: {block.name}"
-                )
-                # 把工具执行结果封装成 tool_result
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,  # 对应 tool_use 的 ID
-                    "content": str(output)[:50000]  # 限制输出长度
-                })
-        # 把工具结果作为“用户消息”喂回模型(继续循环)
-        sub_messages.append({
-            "role": "user",
-            "content": results
-        })
-
-    # 循环结束: 返回结果给父 agent
-    # 从最后一次 response 中提取所有 text block 并拼接
-    return "".join(
-        b.text for b in response.content
-        if hasattr(b, "text")  # 只取 text 类型 block
-    ) or "(no summary)"  # 如果没有文本, 就返回默认值
-
-
-
 # 工具列表(定义工具的名称、描述和输入格式)。模型会根据这个列表来决定调用哪个工具, 以及如何构造输入参数。
-CHILD_TOOLS = [
+TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
@@ -359,27 +291,20 @@ CHILD_TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-]
-PARENT_TOOLS = CHILD_TOOLS + [
     {"name": "todo", "description": "Update task list. Track progress on multi-step tasks.",
      "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}},
-    {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
-     "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
     {"name": "load_skill", "description": "Load specialized knowledge by name.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string", "description": "Skill name to load"}}, "required": ["name"]}},
 ]
 
+
 # -- The dispatch map: {tool_name: handler} --
-CHILD_TOOL_HANDLERS = {
+TOOL_HANDLERS = {
     "bash":       lambda **kw_bash: run_bash(kw_bash["command"]),
     "read_file":  lambda **pkg_read: run_read(pkg_read["path"], pkg_read.get("limit")),
     "write_file": lambda **data_in: run_write(data_in["path"], data_in["content"]),
     "edit_file":  lambda **kw_edit: run_edit(kw_edit["path"], kw_edit["old_text"], kw_edit["new_text"]),
-}
-PARENT_TOOLS_HANDLERS = {
-    **CHILD_TOOL_HANDLERS,
     "todo":       lambda **kw: TODO.update(kw["items"]),
-    "task":       lambda **kw: handle_task(kw["prompt"], kw.get("description", "subtask")),
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
 }
 
@@ -392,7 +317,7 @@ def agent_loop(messages: list):
         # 调用 LLM
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
-            tools=PARENT_TOOLS, max_tokens=8000,
+            tools=TOOLS, max_tokens=8000,
         )
         # 把模型的回复加入对话历史
         messages.append({"role": "assistant","content": response.content})
@@ -408,7 +333,7 @@ def agent_loop(messages: list):
             # 如果这个 block 是工具调用
             if block.type == "tool_use":
                 # 去 TOOL_HANDLERS 字典里查找, 返回一个lambda函数的包装
-                handler = PARENT_TOOLS_HANDLERS.get(block.name)
+                handler = TOOL_HANDLERS.get(block.name)
                 try:
                     # **block.input: AI 提供的参数被解包传入handler。如果工具名不存在(else), 返回错误字符串。
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
