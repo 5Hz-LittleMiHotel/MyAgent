@@ -32,6 +32,29 @@ Three-layer compression pipeline so the agent can work forever:
                   Same as auto, triggered manually.
 
 Key insight: "The agent can forget strategically and keep working forever."
+
+
+### 三层压缩机制
+
+**Layer 1 — micro_compact（微压缩，每轮静默执行）**
+    最轻量的一层，每一轮对话都自动触发：
+    - 把**3轮前**的 tool call 结果内容替换成：`[Previous: used {tool_name}]`
+    - 保留最近3轮的完整结果，更早的只记录"用过什么工具"
+
+**Layer 2 — auto_compact（自动压缩，token 超阈值触发）**
+    当 token 数 > 50000 时触发：
+    1. 把完整对话记录保存到 `.transcripts/` 文件（防丢失）
+    2. 调用 LLM 对整段对话做摘要
+    3. 用这份 `[summary]` **替换所有历史消息**，context 大幅缩减
+
+**Layer 3 — compact tool（主动压缩，手动触发）**
+
+    模型自己可以主动调用 `compact` 工具：
+    - 立即执行和 Layer 2 一样的摘要流程
+    - 区别是**由模型判断时机主动发起**，而非被动触发
+
+三层形成梯度防御：轻量常驻 → 阈值兜底 → 主动应急，共同保证 Agent 永不因 context 溢出而中断。
+
 """
 
 import json

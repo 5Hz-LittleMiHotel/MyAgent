@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # Harness: the loop -- the model's first connection to the real world.
 
+import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 from anthropic import Anthropic
@@ -15,7 +17,9 @@ client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 SKILLS_DIR = WORKDIR / "skills"
 
-
+THRESHOLD = 50000
+TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+KEEP_RECENT = 3
 
 # %% -- SkillLoader: scan skills/<name>/SKILL.md with YAML frontmatter --
 class SkillLoader:
@@ -162,6 +166,68 @@ Behavior: Prefer using tools over generating prose.
 """
 SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."""
 
+# %% ------------------------- compression -------------------------
+
+def estimate_tokens(messages: list) -> int:
+    """Rough token count: ~4 chars per token."""
+    return len(str(messages)) // 4
+
+
+# -- Layer 1: micro_compact - replace old tool results with placeholders --
+def micro_compact(messages: list) -> list:
+    # Collect (msg_index, part_index, tool_result_dict) for all tool_result entries
+    tool_results = []
+    for msg_idx, msg in enumerate(messages):
+        if msg["role"] == "user" and isinstance(msg.get("content"), list):
+            for part_idx, part in enumerate(msg["content"]):
+                if isinstance(part, dict) and part.get("type") == "tool_result":
+                    tool_results.append((msg_idx, part_idx, part))
+    if len(tool_results) <= KEEP_RECENT:
+        return messages
+    # Find tool_name for each result by matching tool_use_id in prior assistant messages
+    tool_name_map = {}
+    for msg in messages:
+        if msg["role"] == "assistant":
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if hasattr(block, "type") and block.type == "tool_use":
+                        tool_name_map[block.id] = block.name
+    # Clear old results (keep last KEEP_RECENT)
+    to_clear = tool_results[:-KEEP_RECENT]
+    for _, _, result in to_clear:
+        if isinstance(result.get("content"), str) and len(result["content"]) > 100:
+            tool_id = result.get("tool_use_id", "")
+            tool_name = tool_name_map.get(tool_id, "unknown")
+            result["content"] = f"[Previous: used {tool_name}]"
+    return messages
+
+
+# -- Layer 2: auto_compact - save transcript, summarize, replace messages --
+def auto_compact(messages: list) -> list:
+    # Save full transcript to disk
+    TRANSCRIPT_DIR.mkdir(exist_ok=True)
+    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+    with open(transcript_path, "w") as f:
+        for msg in messages:
+            f.write(json.dumps(msg, default=str) + "\n")
+    print(f"[transcript saved: {transcript_path}]")
+    # Ask LLM to summarize
+    conversation_text = json.dumps(messages, default=str)[:80000]
+    response = client.messages.create(
+        model=MODEL,
+        messages=[{"role": "user", "content":
+            "Summarize this conversation for continuity. Include: "
+            "1) What was accomplished, 2) Current state, 3) Key decisions made. "
+            "Be concise but preserve critical details.\n\n" + conversation_text}],
+        max_tokens=2000,
+    )
+    summary = response.content[0].text
+    # Replace all messages with compressed summary
+    return [
+        {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
+        {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
+    ]
 
 
 # %% ------- TodoManager: structured state the LLM writes to -------
@@ -295,6 +361,8 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}},
     {"name": "load_skill", "description": "Load specialized knowledge by name.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string", "description": "Skill name to load"}}, "required": ["name"]}},
+    {"name": "compact", "description": "Trigger manual conversation compression.",
+     "input_schema": {"type": "object", "properties": {"focus": {"type": "string", "description": "What to preserve in the summary"}}}},
 ]
 
 
@@ -306,6 +374,7 @@ TOOL_HANDLERS = {
     "edit_file":  lambda **kw_edit: run_edit(kw_edit["path"], kw_edit["old_text"], kw_edit["new_text"]),
     "todo":       lambda **kw: TODO.update(kw["items"]),
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
+    "compact":    lambda **kw: "Manual compression requested.",
 }
 
 
@@ -314,6 +383,12 @@ TOOL_HANDLERS = {
 def agent_loop(messages: list):
     rounds_since_todo = 0 #  in_process 计数器
     while True:
+        # Layer 1: micro_compact before each LLM call
+        micro_compact(messages)
+        # Layer 2: auto_compact if token estimate exceeds threshold
+        if estimate_tokens(messages) > THRESHOLD:
+            print("[auto_compact triggered]")
+            messages[:] = auto_compact(messages)
         # 调用 LLM
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
@@ -327,18 +402,22 @@ def agent_loop(messages: list):
         # 否则: 执行工具调用
         results = []
         used_todo = False
-
+        manual_compact = False
         # 循环中按名称查找处理函数
         for block in response.content:
             # 如果这个 block 是工具调用
             if block.type == "tool_use":
                 # 去 TOOL_HANDLERS 字典里查找, 返回一个lambda函数的包装
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    # **block.input: AI 提供的参数被解包传入handler。如果工具名不存在(else), 返回错误字符串。
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
+                if block.name == "compact":
+                    manual_compact = True
+                    output = "Compressing..."
+                else:
+                    handler = TOOL_HANDLERS.get(block.name)
+                    try:
+                        # **block.input: AI 提供的参数被解包传入handler。如果工具名不存在(else), 返回错误字符串。
+                        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                    except Exception as e:
+                        output = f"Error: {e}"
 
                 # 打印命令与部分输出
                 print(f"> {block.name}: {output[:200]}")
@@ -359,6 +438,10 @@ def agent_loop(messages: list):
         
         # 把工具执行结果作为“用户消息”喂回模型
         messages.append({"role": "user","content": results})
+        # Layer 3: manual compact triggered by the compact tool
+        if manual_compact:
+            print("[manual compact]")
+            messages[:] = auto_compact(messages)
 
 
 
@@ -368,54 +451,15 @@ if __name__ == "__main__":
     while True:
         try:
             query = input("\033[36ms01 >> \033[0m")
-        except (EOFError, KeyboardInterrupt):             # Ctrl+D 或 Ctrl+C 退出
+        except (EOFError, KeyboardInterrupt):
             break
-        if query.strip().lower() in ("q", "exit", ""):    # q / exit / 空字符串 -> 退出
+        if query.strip().lower() in ("q", "exit", ""):
             break
-
         history.append({"role": "user","content": query})
         agent_loop(history)
-
         response_content = history[-1]["content"]
-        # 如果是结构化 block(列表)
-        if isinstance(response_content, list):
+        if isinstance(response_content, list): # 如果是结构化 block(列表)
             for block in response_content:
                 if hasattr(block, "text"): # 有 text 属性就打印
                     print(block.text)
-
         print()  # 空行分隔
-
-"""
-现在有一个问题: 
-设置了一个SkillLoader类用于从skills目录加载工具, 并设置两层加载, Layer 1: 摘要, Layer 2: 按需加载全文。
-一旦设置这个两层加载机制, 好像s04的一些代码就显得冗余了。
-
-第一个agent-builder的SKILL.md包含的提示词内容已简化, 下面是该md文件提供的资源: 
-## Resources
-
-**Philosophy & Theory**:
-- `references/agent-philosophy.md` - Deep dive into why agents work
-
-**Implementation**:
-- `references/minimal-agent.py` - Complete working agent (~80 lines)
-- `references/tool-templates.py` - Capability definitions
-- `references/subagent-pattern.py` - Context isolation
-
-**Scaffolding**:
-- `scripts/init_agent.py` - Generate new agent projects
-
-
-第二个code-review的SKILL.md包含的提示词内容已简化: 
-只有当用户提到‘审查’、‘Bug’、‘安全’这些词时，才需要激活这个模式。包含的内容大概有：
-Node.js	npm audit	检查 package.json 依赖的安全漏洞
-Python	pip-audit	检查 Python 依赖的安全漏洞
-Rust	cargo audit	检查 Rust crate 依赖的安全漏洞
-
-当读到第三个 mcp-builder 的 SKILL.md ，智能体将会做：
-依据此文件编写Python或TypeScript代码，构建独立的MCP服务器以集成外部API、数据库或本地资源。
-它会定义工具函数、配置启动命令，并指导用户将其注册到配置文件中，从而动态扩展自身能力以执行特定任务。
-
-第四个 pdf 的 SKILL.md ：
-该文件定义了PDF处理技能，涵盖读取、创建、合并及拆分等操作，并推荐了PyMuPDF等库。
-Agent读到后，将依据用户指令调用相应工具或代码，执行如提取文本、生成报告或整理文档等具体任务。
-"""
