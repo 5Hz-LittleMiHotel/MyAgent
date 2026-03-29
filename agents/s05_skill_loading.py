@@ -453,3 +453,36 @@ Rust	cargo audit	检查 Rust crate 依赖的安全漏洞
 该文件定义了PDF处理技能，涵盖读取、创建、合并及拆分等操作，并推荐了PyMuPDF等库。
 Agent读到后，将依据用户指令调用相应工具或代码，执行如提取文本、生成报告或整理文档等具体任务。
 """
+
+
+"""
+而且选择tesk还是SKILL建立agent, 也需要考虑一些因素:
+
+task 工具是运行时能力——LLM 在 agent loop 执行过程中，可以动态决定"我现在需要隔离一个子任务"，
+立刻 fork 出一个干净上下文的子代理去执行，结果直接返回到当前对话流里继续推进。
+
+SKILL 里的 subagent 是知识/模板——它告诉 LLM "如何构建一个子代理"，但 LLM 要真正用它，必须先
+ load_skill，读懂内容，然后自己用 write_file + bash 把代码写到磁盘，再 bash 去执行一个新进程。
+
+如果删掉 task, LLM 想隔离子任务: 
+  → load_skill("agent-builder")
+  → 读 SKILL.md，理解模板
+  → write_file("subtask_runner.py", ...)   # 写出一个脚本
+  → bash("python subtask_runner.py")       # 起一个新进程
+  → 等待进程结束，解析输出
+
+相比不删除：
+LLM 想隔离子任务
+  → task(prompt="...")    # 一步完成
+多出来的不只是步骤数——新进程方案有几个真实代价：
+没有共享内存里的 TODO 状态、每次都要重新初始化 Anthropic client、
+子进程的输出需要自己设计序列化格式、出错了没有统一的异常捕获。
+
+什么时候删 task 才合理: 
+如果你未来想让子代理真正并发执行（asyncio 或多进程），或者需要子代理跨机器运行，
+那时候 SKILL 里的外部进程方案才有优势，task 工具确实可以退役。但在现在的单线程同步架构里，
+task 是最轻量、最可靠的隔离机制。
+
+所以这里可以设置系统提示词, 让大模型来选择task or 新建agent工厂. 
+可以后期优化一下. 反正这个版本是没有task的, 给删了.
+"""
