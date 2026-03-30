@@ -169,64 +169,141 @@ SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}. Complete the given
 # %% ------------------------- compression -------------------------
 
 def estimate_tokens(messages: list) -> int:
-    """Rough token count: ~4 chars per token."""
+    """
+    粗略估算 token 数量：
+    假设 1 token ≈ 4 个字符
+    用于判断是否需要进行上下文压缩
+    """
     return len(str(messages)) // 4
 
 
 # -- Layer 1: micro_compact - replace old tool results with placeholders --
 def micro_compact(messages: list) -> list:
-    # Collect (msg_index, part_index, tool_result_dict) for all tool_result entries
+    """
+    第一层压缩（轻量级）：
+    - 找到历史中的 tool_result
+    - 只保留最近 KEEP_RECENT 条
+    - 更早的结果替换为占位符（减少 token）
+    """
+
+    # 收集所有 tool_result 的位置：
+    # (消息索引, 内容索引, tool_result 本体)
     tool_results = []
     for msg_idx, msg in enumerate(messages):
+
+        # tool_result 总是在 user role 且 content 是 list
         if msg["role"] == "user" and isinstance(msg.get("content"), list):
+
+            # 遍历 content 中的每一项（block）
             for part_idx, part in enumerate(msg["content"]):
+
+                # 找到 tool_result 类型
                 if isinstance(part, dict) and part.get("type") == "tool_result":
                     tool_results.append((msg_idx, part_idx, part))
+
+    # 如果 tool_result 数量不多，不做压缩
     if len(tool_results) <= KEEP_RECENT:
         return messages
-    # Find tool_name for each result by matching tool_use_id in prior assistant messages
+
+    # ---------------------------
+    # 构建 tool_use_id → tool_name 映射
+    # ---------------------------
     tool_name_map = {}
+
     for msg in messages:
         if msg["role"] == "assistant":
+
             content = msg.get("content", [])
+
+            # assistant 的 content 是 block 列表
             if isinstance(content, list):
                 for block in content:
+
+                    # 找到 tool_use block
                     if hasattr(block, "type") and block.type == "tool_use":
+
+                        # 建立映射：tool_use_id → 工具名
                         tool_name_map[block.id] = block.name
-    # Clear old results (keep last KEEP_RECENT)
+
+    # ---------------------------
+    # 清理旧的 tool_result（只保留最近 KEEP_RECENT 条）
+    # ---------------------------
     to_clear = tool_results[:-KEEP_RECENT]
+
     for _, _, result in to_clear:
+
+        # 只处理较长内容（避免无意义替换）
         if isinstance(result.get("content"), str) and len(result["content"]) > 100:
+
             tool_id = result.get("tool_use_id", "")
+
+            # 找到对应工具名（如果找不到就标 unknown）
             tool_name = tool_name_map.get(tool_id, "unknown")
+
+            # 替换为简短占位符（极大减少 token）
             result["content"] = f"[Previous: used {tool_name}]"
+
     return messages
 
 
 # -- Layer 2: auto_compact - save transcript, summarize, replace messages --
 def auto_compact(messages: list) -> list:
-    # Save full transcript to disk
+    """
+    第二层压缩（重压缩）：
+    1. 把完整对话保存到磁盘（防止信息丢失）
+    2. 让 LLM 生成摘要
+    3. 用摘要替换整个 history
+    """
+
+    # ---------------------------
+    # 保存完整对话到本地文件（jsonl）
+    # ---------------------------
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
+
+    # 生成带时间戳的文件名
     transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+
     with open(transcript_path, "w") as f:
         for msg in messages:
+            # 每条消息一行（jsonl 格式）
             f.write(json.dumps(msg, default=str) + "\n")
+
     print(f"[transcript saved: {transcript_path}]")
-    # Ask LLM to summarize
+
+    # ---------------------------
+    # 构造用于总结的文本（截断防止超长）
+    # ---------------------------
     conversation_text = json.dumps(messages, default=str)[:80000]
+
+    # 调用 LLM 生成摘要
     response = client.messages.create(
         model=MODEL,
-        messages=[{"role": "user", "content":
-            "Summarize this conversation for continuity. Include: "
-            "1) What was accomplished, 2) Current state, 3) Key decisions made. "
-            "Be concise but preserve critical details.\n\n" + conversation_text}],
+        messages=[{
+            "role": "user",
+            "content":
+                "Summarize this conversation for continuity. Include: "
+                "1) What was accomplished, 2) Current state, 3) Key decisions made. "
+                "Be concise but preserve critical details.\n\n"
+                + conversation_text
+        }],
         max_tokens=2000,
     )
+
+    # 取出摘要文本（第一个 text block）
     summary = response.content[0].text
-    # Replace all messages with compressed summary
+
+    # ---------------------------
+    # 用摘要替换整个对话历史
+    # ---------------------------
     return [
-        {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
-        {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
+        {
+            "role": "user",
+            "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"
+        },
+        {
+            "role": "assistant",
+            "content": "Understood. I have the context from the summary. Continuing."
+        },
     ]
 
 
