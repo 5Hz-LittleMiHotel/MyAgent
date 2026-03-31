@@ -177,6 +177,19 @@ def estimate_tokens(messages: list) -> int:
     return len(str(messages)) // 4
 
 
+def extract_critical(messages):
+    # 找最近一条报错、最近一条in_progress的todo
+    errors = []
+    for msg in messages:
+        if msg["role"] == "user" and isinstance(msg.get("content"), list):
+            for part in msg["content"]:
+                if isinstance(part, dict) and part.get("type") == "tool_result":
+                    content = part.get("content", "")
+                    if "Error" in content or "Traceback" in content:
+                        errors.append(content[-2000:])  # 只保留尾部
+    return errors[-1] if errors else None
+
+
 # -- Layer 1: micro_compact - replace old tool results with placeholders --
 def micro_compact(messages: list) -> list:
     """
@@ -292,13 +305,25 @@ def auto_compact(messages: list) -> list:
     # 取出摘要文本（第一个 text block）
     summary = response.content[0].text
 
+    # 如果找到了报错内容，就把它包在<critical_context>标签里
+    critical = extract_critical(messages)
+    preserved = f"\n\n<critical_context>\n{critical}\n</critical_context>" if critical else ""
+
     # ---------------------------
     # 用摘要替换整个对话历史
     # ---------------------------
+    # LLM生成的摘要, 最近一条报错的尾部的2000个字符, 以及现在的状态.
     return [
+        # 摘要负责还原"做了什么"，critical_context(preserved)负责保留"卡在哪里"，todos负责告诉模型"现在状态是什么"。
+        # 三者互补，弥补auto_compact丢失推理证据的问题
         {
             "role": "user",
-            "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"
+            "content": (
+                f"[Conversation compressed. Transcript: {transcript_path}]\n\n"
+                f"{summary}"
+                f"{preserved}\n\n"
+                f"<todos>\n{TODO.render()}\n</todos>"
+            )
         },
         {
             "role": "assistant",
@@ -484,7 +509,6 @@ def agent_loop(messages: list):
         for block in response.content:
             # 如果这个 block 是工具调用
             if block.type == "tool_use":
-                # 去 TOOL_HANDLERS 字典里查找, 返回一个lambda函数的包装
                 if block.name == "compact":
                     manual_compact = True
                     output = "Compressing..."
