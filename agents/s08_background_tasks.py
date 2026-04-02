@@ -194,7 +194,6 @@ def agent_loop(messages: list):
                 f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
             )
             messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>"})
-            messages.append({"role": "assistant", "content": "Noted background results."})
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
@@ -210,7 +209,8 @@ def agent_loop(messages: list):
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+                print(f"> {block.name}:")
+                print(str(output)[:200])
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         messages.append({"role": "user", "content": results})
 

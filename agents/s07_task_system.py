@@ -4,12 +4,12 @@
 s07_task_system.py - Tasks
 
 Tasks persist as JSON files in .tasks/ so they survive context compression.
-Each task has a dependency graph (blockedBy/blocks).
+Each task has a dependency graph (blockedBy).
 
     .tasks/
       task_1.json  {"id":1, "subject":"...", "status":"completed", ...}
       task_2.json  {"id":2, "blockedBy":[1], "status":"pending", ...}
-      task_3.json  {"id":3, "blockedBy":[2], "blocks":[], ...}
+      task_3.json  {"id":3, "blockedBy":[2], ...}
 
     Dependency resolution:
     +----------+     +----------+     +----------+
@@ -62,45 +62,35 @@ class TaskManager:
 
     def _save(self, task: dict):
         path = self.dir / f"task_{task['id']}.json"
-        path.write_text(json.dumps(task, indent=2))
+        path.write_text(json.dumps(task, indent=2, ensure_ascii=False))
 
     def create(self, subject: str, description: str = "") -> str:
         task = {
             "id": self._next_id, "subject": subject, "description": description,
-            "status": "pending", "blockedBy": [], "blocks": [], "owner": "",
+            "status": "pending", "blockedBy": [], "owner": "",
         }
         self._save(task)
         self._next_id += 1
-        return json.dumps(task, indent=2)
+        return json.dumps(task, indent=2, ensure_ascii=False)
 
     def get(self, task_id: int) -> str:
-        return json.dumps(self._load(task_id), indent=2)
+        return json.dumps(self._load(task_id), indent=2, ensure_ascii=False)
 
     def update(self, task_id: int, status: str = None,
-               add_blocked_by: list = None, add_blocks: list = None) -> str:
+               add_blocked_by: list = None, remove_blocked_by: list = None) -> str:
         task = self._load(task_id)
         if status:
             if status not in ("pending", "in_progress", "completed"):
                 raise ValueError(f"Invalid status: {status}")
             task["status"] = status
-            # When a task is completed, remove it from all other tasks' blockedBy
             if status == "completed":
                 self._clear_dependency(task_id)
         if add_blocked_by:
             task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
-        if add_blocks:
-            task["blocks"] = list(set(task["blocks"] + add_blocks))
-            # Bidirectional: also update the blocked tasks' blockedBy lists
-            for blocked_id in add_blocks:
-                try:
-                    blocked = self._load(blocked_id)
-                    if task_id not in blocked["blockedBy"]:
-                        blocked["blockedBy"].append(task_id)
-                        self._save(blocked)
-                except ValueError:
-                    pass
+        if remove_blocked_by:
+            task["blockedBy"] = [x for x in task["blockedBy"] if x not in remove_blocked_by]
         self._save(task)
-        return json.dumps(task, indent=2)
+        return json.dumps(task, indent=2, ensure_ascii=False)
 
     def _clear_dependency(self, completed_id: int):
         """Remove completed_id from all other tasks' blockedBy lists."""
@@ -112,7 +102,11 @@ class TaskManager:
 
     def list_all(self) -> str:
         tasks = []
-        for f in sorted(self.dir.glob("task_*.json")):
+        files = sorted(
+            self.dir.glob("task_*.json"),
+            key=lambda f: int(f.stem.split("_")[1])
+        )
+        for f in files:
             tasks.append(json.loads(f.read_text()))
         if not tasks:
             return "No tasks."
@@ -182,7 +176,7 @@ TOOL_HANDLERS = {
     "write_file":  lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":   lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
-    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("addBlockedBy"), kw.get("addBlocks")),
+    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("addBlockedBy"), kw.get("removeBlockedBy")),
     "task_list":   lambda **kw: TASKS.list_all(),
     "task_get":    lambda **kw: TASKS.get(kw["task_id"]),
 }
@@ -199,7 +193,7 @@ TOOLS = [
     {"name": "task_create", "description": "Create a new task.",
      "input_schema": {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, "required": ["subject"]}},
     {"name": "task_update", "description": "Update a task's status or dependencies.",
-     "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}, "addBlockedBy": {"type": "array", "items": {"type": "integer"}}, "addBlocks": {"type": "array", "items": {"type": "integer"}}}, "required": ["task_id"]}},
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}, "addBlockedBy": {"type": "array", "items": {"type": "integer"}}, "removeBlockedBy": {"type": "array", "items": {"type": "integer"}}}, "required": ["task_id"]}},
     {"name": "task_list", "description": "List all tasks with status summary.",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "task_get", "description": "Get full details of a task by ID.",
@@ -224,7 +218,8 @@ def agent_loop(messages: list):
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+                print(f"> {block.name}:")
+                print(str(output)[:200])
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         messages.append({"role": "user", "content": results})
 

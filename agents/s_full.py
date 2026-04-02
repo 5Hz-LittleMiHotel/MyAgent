@@ -246,7 +246,7 @@ def auto_compact(messages: list) -> list:
     with open(path, "w") as f:
         for msg in messages:
             f.write(json.dumps(msg, default=str) + "\n")
-    conv_text = json.dumps(messages, default=str)[:80000]
+    conv_text = json.dumps(messages, default=str)[-80000:]
     resp = client.messages.create(
         model=MODEL,
         messages=[{"role": "user", "content": f"Summarize for continuity:\n{conv_text}"}],
@@ -255,7 +255,6 @@ def auto_compact(messages: list) -> list:
     summary = resp.content[0].text
     return [
         {"role": "user", "content": f"[Compressed. Transcript: {path}]\n{summary}"},
-        {"role": "assistant", "content": "Understood. Continuing with summary context."},
     ]
 
 
@@ -278,7 +277,7 @@ class TaskManager:
 
     def create(self, subject: str, description: str = "") -> str:
         task = {"id": self._next_id(), "subject": subject, "description": description,
-                "status": "pending", "owner": None, "blockedBy": [], "blocks": []}
+                "status": "pending", "owner": None, "blockedBy": []}
         self._save(task)
         return json.dumps(task, indent=2)
 
@@ -286,7 +285,7 @@ class TaskManager:
         return json.dumps(self._load(tid), indent=2)
 
     def update(self, tid: int, status: str = None,
-               add_blocked_by: list = None, add_blocks: list = None) -> str:
+               add_blocked_by: list = None, remove_blocked_by: list = None) -> str:
         task = self._load(tid)
         if status:
             task["status"] = status
@@ -301,8 +300,8 @@ class TaskManager:
                 return f"Task {tid} deleted"
         if add_blocked_by:
             task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
-        if add_blocks:
-            task["blocks"] = list(set(task["blocks"] + add_blocks))
+        if remove_blocked_by:
+            task["blockedBy"] = [x for x in task["blockedBy"] if x not in remove_blocked_by]
         self._save(task)
         return json.dumps(task, indent=2)
 
@@ -351,7 +350,7 @@ class BackgroundManager:
     def check(self, tid: str = None) -> str:
         if tid:
             t = self.tasks.get(tid)
-            return f"[{t['status']}] {t.get('result', '(running)')}" if t else f"Unknown: {tid}"
+            return f"[{t['status']}] {t.get('result') or '(running)'}" if t else f"Unknown: {tid}"
         return "\n".join(f"{k}: [{v['status']}] {v['command'][:60]}" for k, v in self.tasks.items()) or "No bg tasks."
 
     def drain(self) -> list:
@@ -588,7 +587,7 @@ TOOL_HANDLERS = {
     "check_background": lambda **kw: BG.check(kw.get("task_id")),
     "task_create":      lambda **kw: TASK_MGR.create(kw["subject"], kw.get("description", "")),
     "task_get":         lambda **kw: TASK_MGR.get(kw["task_id"]),
-    "task_update":      lambda **kw: TASK_MGR.update(kw["task_id"], kw.get("status"), kw.get("add_blocked_by"), kw.get("add_blocks")),
+    "task_update":      lambda **kw: TASK_MGR.update(kw["task_id"], kw.get("status"), kw.get("add_blocked_by"), kw.get("remove_blocked_by")),
     "task_list":        lambda **kw: TASK_MGR.list_all(),
     "spawn_teammate":   lambda **kw: TEAM.spawn(kw["name"], kw["role"], kw["prompt"]),
     "list_teammates":   lambda **kw: TEAM.list_all(),
@@ -627,7 +626,7 @@ TOOLS = [
     {"name": "task_get", "description": "Get task details by ID.",
      "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
     {"name": "task_update", "description": "Update task status or dependencies.",
-     "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "deleted"]}, "add_blocked_by": {"type": "array", "items": {"type": "integer"}}, "add_blocks": {"type": "array", "items": {"type": "integer"}}}, "required": ["task_id"]}},
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "deleted"]}, "add_blocked_by": {"type": "array", "items": {"type": "integer"}}, "remove_blocked_by": {"type": "array", "items": {"type": "integer"}}}, "required": ["task_id"]}},
     {"name": "task_list", "description": "List all tasks.",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "spawn_teammate", "description": "Spawn a persistent autonomous teammate.",
@@ -665,12 +664,10 @@ def agent_loop(messages: list):
         if notifs:
             txt = "\n".join(f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs)
             messages.append({"role": "user", "content": f"<background-results>\n{txt}\n</background-results>"})
-            messages.append({"role": "assistant", "content": "Noted background results."})
         # s10: check lead inbox
         inbox = BUS.read_inbox("lead")
         if inbox:
             messages.append({"role": "user", "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>"})
-            messages.append({"role": "assistant", "content": "Noted inbox messages."})
         # LLM call
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
@@ -692,19 +689,21 @@ def agent_loop(messages: list):
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+                print(f"> {block.name}:")
+                print(str(output)[:200])
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
                 if block.name == "TodoWrite":
                     used_todo = True
         # s03: nag reminder (only when todo workflow is active)
         rounds_without_todo = 0 if used_todo else rounds_without_todo + 1
         if TODO.has_open_items() and rounds_without_todo >= 3:
-            results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
+            results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
         messages.append({"role": "user", "content": results})
         # s06: manual compress
         if manual_compress:
             print("[manual compact]")
             messages[:] = auto_compact(messages)
+            return
 
 
 # === SECTION: repl ===
@@ -733,4 +732,9 @@ if __name__ == "__main__":
             continue
         history.append({"role": "user", "content": query})
         agent_loop(history)
+        response_content = history[-1]["content"]
+        if isinstance(response_content, list):
+            for block in response_content:
+                if hasattr(block, "text"):
+                    print(block.text)
         print()
