@@ -21,6 +21,191 @@ THRESHOLD = 50000
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 KEEP_RECENT = 3
 
+TASKS_DIR = WORKDIR / ".tasks"
+
+# %% -- TaskManager: CRUD with dependency graph, persisted as JSON files --
+class TaskManager:
+    # TaskManager 类：用于管理任务的完整工具箱
+    # 任务以 JSON 文件形式存储在磁盘上，每个任务一个文件
+
+    def __init__(self, tasks_dir: Path):
+        self.dir = tasks_dir
+        # 把传入的目录路径保存为实例属性，之后所有方法都通过 self.dir 访问它
+        self.dir.mkdir(exist_ok=True)
+        # 创建该目录。exist_ok=True 表示"如果目录已存在就不报错，直接跳过"
+        self._next_id = self._max_id() + 1
+        # 调用 _max_id() 找出当前已有任务中最大的 ID，再加 1，作为下一个新任务的 ID
+        # 比如已有 task_1.json、task_3.json，则 _max_id()=3，_next_id=4
+        # 下划线前缀（_next_id）是 Python 约定，表示"内部使用，外部别随意访问"
+
+
+
+    def _max_id(self) -> int:
+        # 扫描任务目录，找出已有任务文件中最大的任务 ID
+
+        ids = [int(f.stem.split("_")[1]) for f in self.dir.glob("task_*.json")]
+        # 这是一个列表推导式，等价于一个 for 循环，逐步拆解：
+        #   self.dir.glob("task_*.json")
+        #     → 找出目录下所有文件名匹配 "task_*.json" 的文件，* 是通配符
+        #     → 例如找到：task_1.json, task_3.json, task_5.json
+        #   f.stem
+        #     → 取文件名（不含扩展名），如 "task_3.json" 的 stem 是 "task_3"
+        #   .split("_")[1]
+        #     → 按下划线切割字符串，"task_3" → ["task", "3"]，取索引1即 "3"
+        #   int(...)
+        #     → 把字符串 "3" 转成整数 3
+        # 最终 ids 是所有任务 ID 的整数列表，如 [1, 3, 5]
+        return max(ids) if ids else 0
+        # 如果 ids 不为空，返回最大值；如果目录里没有任务文件，ids 是空列表，返回 0
+
+
+
+    def _load(self, task_id: int) -> dict:
+        # 根据任务 ID 从磁盘读取对应的 JSON 文件，返回字典
+
+        path = self.dir / f"task_{task_id}.json"
+        # Path 对象支持用 / 拼接路径（比字符串拼接更安全跨平台）
+        # f"task_{task_id}.json" 是 f-string，会把变量 task_id 插入字符串
+        # 例如 task_id=3 → path 是 "tasks/task_3.json"
+        if not path.exists():
+            raise ValueError(f"Task {task_id} not found")
+        # 检查文件是否存在，如果不存在就抛出 ValueError 异常，终止程序并提示错误信息
+        return json.loads(path.read_text())
+        # path.read_text() → 把文件内容读取为字符串
+        # json.loads(...)  → 把 JSON 格式的字符串解析成 Python 字典
+
+
+
+    def _save(self, task: dict):
+        # 把一个任务字典写入磁盘对应的 JSON 文件
+
+        path = self.dir / f"task_{task['id']}.json"
+        # 根据任务字典里的 id 字段构造文件路径
+        path.write_text(json.dumps(task, indent=2, ensure_ascii=False))
+        # json.dumps(task, ...) → 把 Python 字典转成 JSON 格式的字符串
+        #   indent=2          → 格式化输出，每层缩进 2 个空格，方便人类阅读
+        #   ensure_ascii=False → 允许中文等非 ASCII 字符直接写入，不转成 \uXXXX 转义序列
+        # path.write_text(...) → 把字符串写入文件（文件不存在会创建，已存在会覆盖）
+
+
+
+    def create(self, subject: str, description: str = "") -> str:
+        # 创建一个新任务并保存，返回该任务的 JSON 字符串
+        # subject: str      → 任务标题，必填
+        # description: str = "" → 任务描述，选填，默认为空字符串
+
+        task = {
+            "id": self._next_id,         # 分配当前可用的 ID
+            "subject": subject,           # 任务标题
+            "description": description,   # 任务描述
+            "status": "pending",          # 初始状态固定为 "pending"（待处理）
+            "blockedBy": [],              # 阻塞依赖列表，初始为空（没有前置任务）
+            "owner": "",                  # 负责人，初始为空
+        } # 构造一个新任务字典，包含所有字段的初始值
+        self._save(task)
+        # 把新任务写入磁盘
+        self._next_id += 1
+        # ID 计数器加 1，确保下次创建的任务拿到不同的 ID
+        return json.dumps(task, indent=2, ensure_ascii=False)
+        # 返回格式化的 JSON 字符串，方便调用者查看或展示
+
+
+
+    def get(self, task_id: int) -> str:
+        # 根据 ID 查询单个任务，返回格式化 JSON 字符串
+
+        return json.dumps(self._load(task_id), indent=2, ensure_ascii=False)
+        # _load() 从磁盘读取任务字典，json.dumps() 再转回格式化字符串返回
+        # 看起来多此一举，但统一了返回格式，外部调用者总是拿到字符串
+
+
+
+    def update(self, task_id: int, status: str = None,
+               add_blocked_by: list = None, remove_blocked_by: list = None) -> str:
+        # 更新一个已有任务的状态或依赖关系. 所有参数都有默认值 None，表示"不传就不修改该字段"
+
+        task = self._load(task_id)
+        # 先从磁盘读取现有数据(以字典形式)，避免覆盖未修改的字段
+        if status:
+            # 只有调用者传入了 status 参数才执行这段（None 和空字符串都视为"没传"）
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"Invalid status: {status}") # 防止非法数据写入
+            task["status"] = status
+            if status == "completed":
+                self._clear_dependency(task_id) # 如果任务完成了，从其他任务的依赖列表中移除它
+        if add_blocked_by:
+            # 如果传入了需要新增的依赖 ID 列表
+            task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
+            # task["blockedBy"] + add_blocked_by → 合并两个列表
+            # set(...) → 转成集合，自动去重（防止同一个依赖被加两次）
+            # list(...) → 再转回列表，因为 JSON 不支持集合类型
+        if remove_blocked_by:
+            # 如果传入了需要移除的依赖 ID 列表
+            task["blockedBy"] = [x for x in task["blockedBy"] if x not in remove_blocked_by]
+        self._save(task) # 把修改后的任务字典写回磁盘
+        return json.dumps(task, indent=2, ensure_ascii=False) # 返回更新后的任务 JSON 字符串
+
+
+
+    def _clear_dependency(self, completed_id: int):
+        """Remove completed_id from all other tasks' blockedBy lists."""
+        # 当一个任务完成时，自动把它从所有其他任务的"被阻塞"列表中删除
+
+        for f in self.dir.glob("task_*.json"):
+            # 遍历目录中的每一个任务文件
+            task = json.loads(f.read_text())
+            # 把每个文件读取并解析成字典
+            if completed_id in task.get("blockedBy", []):
+                # task.get("blockedBy", []) → 安全地获取 blockedBy 字段
+                task["blockedBy"].remove(completed_id)
+                self._save(task) # 把修改保存回磁盘
+
+
+
+    def list_all(self) -> str:
+        # 列出所有任务，返回格式化的文本摘要
+
+        tasks = []
+        # 初始化一个空列表，用来收集所有任务字典
+        files = sorted(self.dir.glob("task_*.json"),
+            key=lambda f: int(f.stem.split("_")[1]))
+        # 获取所有任务文件，并按任务 ID 从小到大排序
+        # sorted(..., key=...) → 按 key 函数的返回值排序
+        # lambda f: int(f.stem.split("_")[1])
+        #   → 匿名函数：对每个文件 f，提取其 ID 数字作为排序依据
+        #   → 确保输出顺序是 task_1, task_2, task_3...而非文件系统的随机顺序
+        # sorted() 的第一个参数是 self.dir.glob("task_*.json")，它产出的每一个元素都是 Path 文件对象。
+        # sorted() 在内部遍历这些元素时，会把每一个元素依次传给 key 函数，所以 f 自然就是 Path 文件对象。
+        for f in files:
+            tasks.append(json.loads(f.read_text()))
+        # 依次读取每个文件，解析为字典，追加到 tasks 列表
+        if not tasks:
+            return "No tasks."
+        # 如果没有任何任务文件，直接返回提示字符串
+        lines = []
+        # 初始化空列表，每个元素是一行文本
+        for t in tasks:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(t["status"], "[?]")
+            # 用字典映射把状态转成可视化符号：
+            #   "pending"     → "[ ]"  （待处理，空框）
+            #   "in_progress" → "[>]"  （进行中，箭头）
+            #   "completed"   → "[x]"  （已完成，打叉）
+            # .get(t["status"], "[?]") → 如果状态不在字典中，返回 "[?]" 作为默认值
+            blocked = f" (blocked by: {t['blockedBy']})" if t.get("blockedBy") else ""
+            # 如果任务有依赖（blockedBy 不为空列表），生成 " (blocked by: [1, 2])" 这样的附加信息
+            # t.get("blockedBy") → 空列表 [] 在 Python 中是假值，所以没有依赖时 else 分支返回空字符串
+            lines.append(f"{marker} #{t['id']}: {t['subject']}{blocked}")
+            # 拼成一行，例如：
+            #   "[ ] #1: 写周报"
+            #   "[>] #2: 做 PPT (blocked by: [1])"
+            #   "[x] #3: 开会"
+        return "\n".join(lines)
+        # 把所有行用换行符连接成一个字符串并返回
+        # "\n".join(列表) 是 Python 中把列表拼成多行文本的标准写法
+
+
+TASKS = TaskManager(TASKS_DIR)
+
 # %% -- SkillLoader: scan skills/<name>/SKILL.md with YAML frontmatter --
 class SkillLoader:
     def __init__(self, skills_dir: Path):
@@ -465,6 +650,14 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"name": {"type": "string", "description": "Skill name to load"}}, "required": ["name"]}},
     {"name": "compact", "description": "Trigger manual conversation compression.",
      "input_schema": {"type": "object", "properties": {"focus": {"type": "string", "description": "What to preserve in the summary"}}}},
+    {"name": "task_create", "description": "Create a new task.",
+     "input_schema": {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, "required": ["subject"]}},
+    {"name": "task_update", "description": "Update a task's status or dependencies.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}, "addBlockedBy": {"type": "array", "items": {"type": "integer"}}, "removeBlockedBy": {"type": "array", "items": {"type": "integer"}}}, "required": ["task_id"]}},
+    {"name": "task_list", "description": "List all tasks with status summary.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "task_get", "description": "Get full details of a task by ID.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
 ]
 
 
@@ -477,6 +670,10 @@ TOOL_HANDLERS = {
     "todo":       lambda **kw: TODO.update(kw["items"]),
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
     "compact":    lambda **kw: "Manual compression requested.",
+    "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
+    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("addBlockedBy"), kw.get("removeBlockedBy")),
+    "task_list":   lambda **kw: TASKS.list_all(),
+    "task_get":    lambda **kw: TASKS.get(kw["task_id"]),
 }
 
 
@@ -485,34 +682,42 @@ TOOL_HANDLERS = {
 def agent_loop(messages: list):
     rounds_since_todo = 0 #  in_process 计数器
     while True:
+
+        # <<<<<<<<<<<<<<<< compact ----------------
         # Layer 1: micro_compact before each LLM call
         micro_compact(messages)
         # Layer 2: auto_compact if token estimate exceeds threshold
         if estimate_tokens(messages) > THRESHOLD:
             print("[auto_compact triggered]")
             messages[:] = auto_compact(messages)
+        # ---------------- compact >>>>>>>>>>>>>>>>
+
         # 调用 LLM
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
-        # 把模型的回复加入对话历史
         messages.append({"role": "assistant","content": response.content})
-        # 如果模型没有调用工具 -> 结束循环
         if response.stop_reason != "tool_use":
             return
-        # 否则: 执行工具调用
         results = []
-        used_todo = False
+
+        # <<<<<<<<<<<< todo and compact ------------
+        used_todo =False 
         manual_compact = False
-        # 循环中按名称查找处理函数
+        # ------------ todo and compact >>>>>>>>>>>>
+
         for block in response.content:
             # 如果这个 block 是工具调用
             if block.type == "tool_use":
+
+                # <<<<<<<<<<<< compact ------------
                 if block.name == "compact":
                     manual_compact = True
                     output = "Compressing..."
                 else:
+                # ------------ compact >>>>>>>>>>>>
+
                     handler = TOOL_HANDLERS.get(block.name)
                     try:
                         # **block.input: AI 提供的参数被解包传入handler。如果工具名不存在(else), 返回错误字符串。
@@ -521,28 +726,32 @@ def agent_loop(messages: list):
                         output = f"Error: {e}"
 
                 # 打印命令与部分输出
-                print(f"> {block.name}: {output[:200]}")
+                print(f"> {block.name}:")
+                print(str(output)[:200])
                 # 收集结果
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,  # 对应 tool_use 的 ID
                     "content": output
                 })
-
+        # <<<<<<<<<<<<<<<<<<<<<< todo ----------------------
                 if block.name == "todo":
                     used_todo = True
-
         # 模型连续 3 轮以上不调用 todo 时注入提醒。
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         if rounds_since_todo >= 3:
             results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
-        
+        # ---------------------- todo >>>>>>>>>>>>>>>>>>>>>>>
+
         # 把工具执行结果作为“用户消息”喂回模型
         messages.append({"role": "user","content": results})
+
+        # <<<<<<<<<<<<<<<<<<<<<< compact ---------------------
         # Layer 3: manual compact triggered by the compact tool
         if manual_compact:
             print("[manual compact]")
             messages[:] = auto_compact(messages)
+        # -------------------- compact >>>>>>>>>>>>>>>>>>>>>>>
 
 
 
