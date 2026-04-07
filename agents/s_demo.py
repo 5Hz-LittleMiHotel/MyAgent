@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# Harness: the loop -- the model's first connection to the real world.
-
 import json
 import os
 import re
@@ -487,8 +484,12 @@ def auto_compact(messages: list) -> list:
         max_tokens=2000,
     )
 
-    # 取出摘要文本（第一个 text block）
-    summary = response.content[0].text
+    # # 取出摘要文本（第一个 text block）
+    # summary = response.content[0].text
+    # 某些模型文本块可能不是第一个元素；这里从“硬编码索引”改为“动态搜索”，增加了空值处理，防御性编程
+    summary = next((block.text for block in response.content if hasattr(block, "text")), "")
+    if not summary:
+        summary = "No summary generated."
 
     # 如果找到了报错内容，就把它包在<critical_context>标签里
     critical = extract_critical(messages)
