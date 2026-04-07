@@ -198,3 +198,91 @@ if __name__ == "__main__":
                     print(block.text)
 
         print()  # 空行分隔
+
+
+# %% -------------- 数据结构讲解 --------------
+
+# 普通回复：
+message = {
+    "role":"assistant",
+    "stop_reason":"tool_use",
+    "content": [
+        {
+            "type":"text",
+            "text":"我来看看当前目录..."
+        },
+        {
+            "type":"tool_use",
+            "id":"toolu_01xyz",
+            "name":"bash",
+            "input": {
+                "command":"ls -la"
+            }
+        }
+    ]
+}
+
+# 调用工具：
+message = {
+    "role":"assistant",
+    "stop_reason":"tool_use",
+    "content": [
+        {
+            "type":"text",
+            "text":"我来看看当前目录..."
+        },
+        {
+            "type":"tool_use",
+            "id":"toolu_01xyz",
+            "name":"bash",
+            "input": {
+                "command":"ls -la"
+            }
+        }
+    ]
+}
+
+# 工具结果：
+message = {
+    "role":"user",
+    "content": [
+        {
+            "type":"tool_result",
+            "tool_use_id":"toolu_01xyz",
+            "content":"main.py README.md .env"
+        }
+    ]
+}
+
+# 完整messages：
+messages = [
+    # 第1轮：用户提问
+    { "role": "user", "content": "列出当前目录" },
+    # 第2轮：模型决定用工具
+    { "role": "assistant", "content": [ text_block, tool_use_block ] },
+    # 第3轮：工具结果喂回（以 user 身份）
+    { "role": "user", "content": [ tool_result_block ] },
+    # 第4轮：模型看到结果后给出最终回答
+    { "role": "assistant", "content": [ text_block ] }
+]
+
+
+
+"""
+content 字段有两种形态。当没有工具调用时，它可以直接是一个字符串；
+一旦涉及工具，它就变成一个 block 列表，每个 block 是 { "type": "...", ...其他字段 } 的对象。
+代码里 for block in response.content 就是在遍历这个列表。
+
+
+block.type 是分支的核心。
+"text" 类型只有 text 字段；
+"tool_use" 类型有 id、name、input 三个字段；
+"tool_result" 类型有 tool_use_id 和 content。
+代码里 if block.type == "tool_use" 就是靠这个做判断。
+
+
+tool_use_id 是配对机制。模型发出 tool_use 时带一个 id，
+你执行完把结果包成 tool_result 时要原样带上这个 id，模型才知道是哪条调用的结果。
+一次可以有多个工具调用，就靠 id 一一对应。
+"""
+# %%
