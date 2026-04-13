@@ -1,3 +1,47 @@
+"""
+s09_agent_teams.py - Agent Teams
+
+Persistent named agents with file-based JSONL inboxes. Each teammate runs
+拥有基于文件的 JSONL 收件箱的、持久化且具名的智能体。
+its own agent loop in a separate thread. Communication via append-only inboxes.
+每个队友都在独立的线程中运行自己的智能体循环。通过“仅追加”的收件箱进行通信。
+
+    Subagent (s04):  spawn -> execute -> return summary -> destroyed
+    Teammate (s09):  spawn -> work -> idle -> work -> ... -> shutdown
+
+    .team/config.json                   .team/inbox/
+    +----------------------------+      +------------------+
+    | {"team_name": "default",   |      | alice.jsonl      |
+    |  "members": [              |      | bob.jsonl        |
+    |    {"name":"alice",        |      | lead.jsonl       |
+    |     "role":"coder",        |      +------------------+
+    |     "status":"idle"}       |
+    |  ]}                        |      send_message("alice", "fix bug"):
+    +----------------------------+        open("alice.jsonl", "a").write(msg)
+
+                                        read_inbox("alice"):
+    spawn_teammate("alice","coder",...)   msgs = [json.loads(l) for l in ...]
+         |                                open("alice.jsonl", "w").close()
+         v                                return msgs  # drain
+    Thread: alice             Thread: bob
+    +------------------+      +------------------+
+    | agent_loop       |      | agent_loop       |
+    | status: working  |      | status: idle     |
+    | ... runs tools   |      | ... waits ...    |
+    | status -> idle   |      |                  |
+    +------------------+      +------------------+
+
+    5 message types (all declared, not all handled here):
+    +-------------------------+-----------------------------------+
+    | message                 | Normal text message               |
+    | broadcast               | Sent to all teammates             |
+    | shutdown_request        | Request graceful shutdown (s10)   |
+    | shutdown_response       | Approve/reject shutdown (s10)     |
+    | plan_approval_response  | Approve/reject plan (s10)         |
+    +-------------------------+-----------------------------------+
+
+Key insight: "Teammates that can talk to each other."
+"""
 import json
 import os
 import re
@@ -11,16 +55,313 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
+
+WORKDIR = Path.cwd()
 SKILLS_DIR = WORKDIR / "skills"
+TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+TASKS_DIR = WORKDIR / ".tasks"
+TEAM_DIR = WORKDIR / ".team"
+INBOX_DIR = TEAM_DIR / "inbox"
 
 THRESHOLD = 50000
-TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 KEEP_RECENT = 3
 
-TASKS_DIR = WORKDIR / ".tasks"
+VALID_MSG_TYPES = {
+    "message",
+    "broadcast",
+    "shutdown_request",
+    "shutdown_response",
+    "plan_approval_response",
+}
+
+# %% ------------ MessageBus and TeammateManager ------------
+
+# -- MessageBus: JSONL inbox per teammate --
+# 消息总线：为每个“队友”提供一个基于JSONL文件的收件箱
+class MessageBus:
+    def __init__(self, inbox_dir: Path):
+        # 收件箱目录（每个成员一个 .jsonl 文件）
+        self.dir = inbox_dir
+        # 创建目录（如果不存在）
+        self.dir.mkdir(parents=True, exist_ok=True)
+
+    def send(self, sender: str, to: str, content: str,
+             msg_type: str = "message", extra: dict = None) -> str:
+        # 校验消息类型是否合法
+        if msg_type not in VALID_MSG_TYPES:
+            return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
+
+        # 构造消息体
+        msg = {
+            "type": msg_type,         # 消息类型（message / broadcast 等）
+            "from": sender,           # 发送者
+            "content": content,       # 消息内容
+            "timestamp": time.time(),# 时间戳
+        }
+
+        # 如果有额外字段，合并进去
+        if extra:
+            msg.update(extra)
+
+        # 收件箱路径（每个用户一个文件）
+        inbox_path = self.dir / f"{to}.jsonl"
+
+        # 以追加方式写入一行JSON（JSONL格式）
+        with open(inbox_path, "a") as f:
+            f.write(json.dumps(msg) + "\n")
+
+        return f"Sent {msg_type} to {to}"
+
+    def read_inbox(self, name: str) -> list:
+        # 获取指定用户的收件箱文件路径
+        inbox_path = self.dir / f"{name}.jsonl"
+
+        # 如果文件不存在，说明没有消息
+        if not inbox_path.exists():
+            return []
+
+        messages = []
+
+        # 逐行读取JSONL文件
+        for line in inbox_path.read_text().strip().splitlines():
+            if line:
+                messages.append(json.loads(line))  # 反序列化为字典
+
+        # 读取后清空收件箱（“消费”模式）
+        inbox_path.write_text("")
+
+        return messages
+
+    def broadcast(self, sender: str, content: str, teammates: list) -> str:
+        # 向所有队友广播（除了自己）
+        count = 0
+
+        for name in teammates:
+            if name != sender:
+                # 调用send发送广播消息
+                self.send(sender, name, content, "broadcast")
+                count += 1
+
+        return f"Broadcast to {count} teammates"
+
+
+# 全局消息总线实例
+BUS = MessageBus(INBOX_DIR)
+
+
+# -- TeammateManager: persistent named agents with config.json --
+# 队友管理器：管理多个“智能体”，并持久化到配置文件
+class TeammateManager:
+    def __init__(self, team_dir: Path):
+        # 团队目录
+        self.dir = team_dir
+        self.dir.mkdir(exist_ok=True)
+
+        # 配置文件路径
+        self.config_path = self.dir / "config.json"
+
+        # 加载配置（成员信息等）
+        self.config = self._load_config()
+
+        # 存储运行中的线程：name -> thread
+        self.threads = {}
+
+    def _load_config(self) -> dict:
+        # 如果配置文件存在，读取并解析
+        if self.config_path.exists():
+            return json.loads(self.config_path.read_text())
+
+        # 否则返回默认配置
+        return {"team_name": "default", "members": []}
+
+    def _save_config(self):
+        # 将当前配置写回文件（带缩进）
+        self.config_path.write_text(json.dumps(self.config, indent=2))
+
+    def _find_member(self, name: str) -> dict:
+        # 根据名字查找成员
+        for m in self.config["members"]:
+            if m["name"] == name:
+                return m
+        return None
+
+    def spawn(self, name: str, role: str, prompt: str) -> str:
+        # 查找是否已有该成员
+        member = self._find_member(name)
+
+        if member:
+            # 如果成员正在运行，不允许重复启动
+            if member["status"] not in ("idle", "shutdown"):
+                return f"Error: '{name}' is currently {member['status']}"
+
+            # 更新状态和角色
+            member["status"] = "working"
+            member["role"] = role
+        else:
+            # 创建新成员
+            member = {"name": name, "role": role, "status": "working"}
+            self.config["members"].append(member)
+
+        # 保存配置
+        self._save_config()
+
+        # 创建线程运行该智能体
+        thread = threading.Thread(
+            target=self._teammate_loop,
+            args=(name, role, prompt),
+            daemon=True,
+        )
+
+        # 保存线程引用
+        self.threads[name] = thread
+
+        # 启动线程
+        thread.start()
+
+        return f"Spawned '{name}' (role: {role})"
+
+    def _teammate_loop(self, name: str, role: str, prompt: str):
+        # 系统提示词（定义智能体身份）
+        sys_prompt = (
+            f"You are '{name}', role: {role}, at {WORKDIR}. "
+            f"Use send_message to communicate. Complete your task."
+        )
+
+        # 初始对话消息
+        messages = [{"role": "user", "content": prompt}]
+
+        # 可用工具列表
+        tools = self._teammate_tools()
+
+        # 最多执行50轮（防止无限循环）
+        for _ in range(50):
+            # 读取收件箱消息
+            inbox = BUS.read_inbox(name)
+
+            # 将消息加入上下文
+            for msg in inbox:
+                messages.append({"role": "user", "content": json.dumps(msg)})
+
+            try:
+                # 调用模型生成回复
+                response = client.messages.create(
+                    model=MODEL,
+                    system=sys_prompt,
+                    messages=messages,
+                    tools=tools,
+                    max_tokens=8000,
+                )
+            except Exception:
+                # 出错直接退出循环
+                break
+
+            # 将模型输出加入对话
+            messages.append({"role": "assistant", "content": response.content})
+
+            # 如果不是工具调用，则任务结束
+            if response.stop_reason != "tool_use":
+                break
+
+            results = []
+
+            # 处理模型发起的工具调用
+            for block in response.content:
+                if block.type == "tool_use":
+                    # 执行工具
+                    output = self._exec(name, block.name, block.input)
+
+                    # 打印日志（调试用）
+                    print(f"  [{name}] {block.name}: {str(output)[:120]}")
+
+                    # 构造工具返回结果
+                    results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": str(output),
+                    })
+
+            # 将工具结果作为用户消息喂回模型（继续对话）
+            messages.append({"role": "user", "content": results})
+
+        # 任务结束后更新成员状态
+        member = self._find_member(name)
+        if member and member["status"] != "shutdown":
+            member["status"] = "idle"
+            self._save_config()
+
+    def _exec(self, sender: str, tool_name: str, args: dict) -> str:
+        # 执行不同工具（调度层）
+
+        if tool_name == "bash":
+            return _run_bash(args["command"])
+
+        if tool_name == "read_file":
+            return _run_read(args["path"])
+
+        if tool_name == "write_file":
+            return _run_write(args["path"], args["content"])
+
+        if tool_name == "edit_file":
+            return _run_edit(args["path"], args["old_text"], args["new_text"])
+
+        if tool_name == "send_message":
+            return BUS.send(
+                sender,
+                args["to"],
+                args["content"],
+                args.get("msg_type", "message")
+            )
+
+        if tool_name == "read_inbox":
+            return json.dumps(BUS.read_inbox(sender), indent=2)
+
+        # 未知工具
+        return f"Unknown tool: {tool_name}"
+
+    def _teammate_tools(self) -> list:
+        # 定义模型可用的工具（函数调用 schema）
+        return [
+            {"name": "bash", "description": "Run a shell command.",
+             "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+
+            {"name": "read_file", "description": "Read file contents.",
+             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+
+            {"name": "write_file", "description": "Write content to file.",
+             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+
+            {"name": "edit_file", "description": "Replace exact text in file.",
+             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+
+            {"name": "send_message", "description": "Send message to a teammate.",
+             "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
+
+            {"name": "read_inbox", "description": "Read and drain your inbox.",
+             "input_schema": {"type": "object", "properties": {}}},
+        ]
+
+    def list_all(self) -> str:
+        # 列出所有成员状态
+        if not self.config["members"]:
+            return "No teammates."
+
+        lines = [f"Team: {self.config['team_name']}"]
+
+        for m in self.config["members"]:
+            lines.append(f"  {m['name']} ({m['role']}): {m['status']}")
+
+        return "\n".join(lines)
+
+    def member_names(self) -> list:
+        # 返回所有成员名字列表
+        return [m["name"] for m in self.config["members"]]
+
+
+# 全局团队管理器实例
+TEAM = TeammateManager(TEAM_DIR)
+
 
 # %% -- TaskManager: CRUD with dependency graph, persisted as JSON files --
 class TaskManager:
@@ -688,7 +1029,7 @@ def safe_path(p: str) -> Path:
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
-def run_bash(command: str) -> str:
+def _run_bash(command: str) -> str:
     # 定义并剔除危险命令
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
@@ -707,7 +1048,7 @@ def run_bash(command: str) -> str:
 # %% ---------------- Tool implementations ----------------
 
 # 安全地读取文件内容
-def run_read(path: str, limit: int = None) -> str:
+def _run_read(path: str, limit: int = None) -> str:
     try:
         # 先通过 safe_path 确认路径合法, 再读取文本内容: 
         lines = safe_path(path).read_text() .splitlines() 
@@ -721,7 +1062,7 @@ def run_read(path: str, limit: int = None) -> str:
 
 
 # 安全地写入文件内容
-def run_write(path: str, content: str) -> str:
+def _run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -732,7 +1073,7 @@ def run_write(path: str, content: str) -> str:
 
 
 # 安全地编辑文件内容(限制路径)
-def run_edit(path: str, old_text: str, new_text: str) -> str:
+def _run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
         fp = safe_path(path)
         content = fp.read_text()
@@ -781,15 +1122,25 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "check_background", "description": "Check background task status. Omit task_id to list all.",
      "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}}},
+    {"name": "spawn_teammate", "description": "Spawn a persistent teammate that runs in its own thread.",
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "role": {"type": "string"}, "prompt": {"type": "string"}}, "required": ["name", "role", "prompt"]}},
+    {"name": "list_teammates", "description": "List all teammates with name, role, status.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "send_message", "description": "Send a message to a teammate's inbox.",
+     "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
+    {"name": "read_inbox", "description": "Read and drain the lead's inbox.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "broadcast", "description": "Send a message to all teammates.",
+     "input_schema": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
 ]
 
 
 # -- The dispatch map: {tool_name: handler} --
 TOOL_HANDLERS = {
-    "bash":       lambda **kw_bash: run_bash(kw_bash["command"]),
-    "read_file":  lambda **pkg_read: run_read(pkg_read["path"], pkg_read.get("limit")),
-    "write_file": lambda **data_in: run_write(data_in["path"], data_in["content"]),
-    "edit_file":  lambda **kw_edit: run_edit(kw_edit["path"], kw_edit["old_text"], kw_edit["new_text"]),
+    "bash":       lambda **kw_bash: _run_bash(kw_bash["command"]),
+    "read_file":  lambda **pkg_read: _run_read(pkg_read["path"], pkg_read.get("limit")),
+    "write_file": lambda **data_in: _run_write(data_in["path"], data_in["content"]),
+    "edit_file":  lambda **kw_edit: _run_edit(kw_edit["path"], kw_edit["old_text"], kw_edit["new_text"]),
     "todo":       lambda **kw: TODO.update(kw["items"]),
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
     "compact":    lambda **kw: "Manual compression requested.",
@@ -799,18 +1150,23 @@ TOOL_HANDLERS = {
     "task_get":    lambda **kw: TASKS.get(kw["task_id"]),
     "background_run":   lambda **kw: BG.run(kw["command"]),
     "check_background": lambda **kw: BG.check(kw.get("task_id")),
+        "spawn_teammate":  lambda **kw: TEAM.spawn(kw["name"], kw["role"], kw["prompt"]),
+    "list_teammates":  lambda **kw: TEAM.list_all(),
+    "send_message":    lambda **kw: BUS.send("lead", kw["to"], kw["content"], kw.get("msg_type", "message")),
+    "read_inbox":      lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2),
+    "broadcast":       lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
 }
 
 # 系统提示词
 SYSTEM = f"""
-You are a coding agent at {WORKDIR}.
+You are a coding agent and a team lead at {WORKDIR}. Spawn teammates and communicate via inboxes.
 Planning: Use the todo tool to plan multi-step tasks (mark as in_progress when starting, completed when done). 
           Use the task tool to delegate exploration or subtasks. 
           Use background_run for long-running commands.
 Knowledge: Use load_skill to access specialized knowledge for unfamiliar topics. Available skills: {SKILL_LOADER.get_descriptions()}.
 Behavior: Prefer using tools over generating prose.
 """
-SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."""
+# SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."""
 
 # %% ---------------- Agent loop with nag reminder injection ----------------
 
@@ -818,16 +1174,16 @@ def agent_loop(messages: list):
     rounds_since_todo = 0 #  in_process 计数器
     while True:
 
-        # <<<<<<<<<<<<<<<< compact ----------------
+        # TODO:<<<<<<<<<<<<<<<< compact ----------------
         # Layer 1: micro_compact before each LLM call
         micro_compact(messages)
         # Layer 2: auto_compact if token estimate exceeds threshold
         if estimate_tokens(messages) > THRESHOLD:
             print("[auto_compact triggered]")
             messages[:] = auto_compact(messages)
-        # ---------------- compact >>>>>>>>>>>>>>>>
+        # TODO:---------------- compact >>>>>>>>>>>>>>>>
 
-        # <<<<<<<<<<<<<<<< background_task ----------------
+        # TODO:<<<<<<<<<<<<<<<< background_task ----------------
         # Drain background notifications and inject as system message before LLM call
         notifs = BG.drain_notifications()
         if notifs and messages:
@@ -835,7 +1191,16 @@ def agent_loop(messages: list):
                 f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
             )
             messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>"})
-        # ---------------- background_task >>>>>>>>>>>>>>>>
+        # TODO:---------------- background_task >>>>>>>>>>>>>>>>
+
+        # TODO:<<<<<<<<<<<< agent_teams:read_inbox ------------
+        inbox = BUS.read_inbox("lead")
+        if inbox:
+            messages.append({
+                "role": "user",
+                "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
+            })
+        # TODO:------------ agent_teams:read_inbox >>>>>>>>>>>>
 
         # 调用 LLM
         response = client.messages.create(
@@ -847,21 +1212,21 @@ def agent_loop(messages: list):
             return
         results = []
 
-        # <<<<<<<<<<<< todo and compact ------------
+        # TODO:<<<<<<<<<<<< todo and compact ------------
         used_todo =False 
         manual_compact = False
-        # ------------ todo and compact >>>>>>>>>>>>
+        # TODO:------------ todo and compact >>>>>>>>>>>>
 
         for block in response.content:
             # 如果这个 block 是工具调用
             if block.type == "tool_use":
 
-                # <<<<<<<<<<<< compact ------------
+                # TODO:<<<<<<<<<<<< compact ------------
                 if block.name == "compact":
                     manual_compact = True
                     output = "Compressing..."
                 else:
-                # ------------ compact >>>>>>>>>>>>
+                # TODO:------------ compact >>>>>>>>>>>>
 
                     handler = TOOL_HANDLERS.get(block.name)
                     try:
@@ -879,24 +1244,24 @@ def agent_loop(messages: list):
                     "tool_use_id": block.id,  # 对应 tool_use 的 ID
                     "content": output
                 })
-        # <<<<<<<<<<<<<<<<<<<<<< todo ----------------------
+        # TODO:<<<<<<<<<<<<<<<<<<<<<< todo ----------------------
                 if block.name == "todo":
                     used_todo = True
         # 模型连续 3 轮以上不调用 todo 时注入提醒。
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         if rounds_since_todo >= 3:
             results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
-        # ---------------------- todo >>>>>>>>>>>>>>>>>>>>>>>
+        # TODO:---------------------- todo >>>>>>>>>>>>>>>>>>>>>>>
 
         # 把工具执行结果作为“用户消息”喂回模型
         messages.append({"role": "user","content": results})
 
-        # <<<<<<<<<<<<<<<<<<<<<< compact ---------------------
+        # TODO:<<<<<<<<<<<<<<<<<<<<<< compact ---------------------
         # Layer 3: manual compact triggered by the compact tool
         if manual_compact:
             print("[manual compact]")
             messages[:] = auto_compact(messages)
-        # -------------------- compact >>>>>>>>>>>>>>>>>>>>>>>
+        # TODO:-------------------- compact >>>>>>>>>>>>>>>>>>>>>>>
 
 
 
@@ -910,6 +1275,16 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+
+        # TODO:<<<< agent_teams:Command-line Debugger ----
+        if query.strip() == "/team":
+            print(TEAM.list_all())
+            continue
+        if query.strip() == "/inbox":
+            print(json.dumps(BUS.read_inbox("lead"), indent=2))
+            continue
+        # TODO:---- agent_teams:Command-line Debugger >>>>
+
         history.append({"role": "user","content": query})
         agent_loop(history)
         response_content = history[-1]["content"]
@@ -918,3 +1293,23 @@ if __name__ == "__main__":
                 if hasattr(block, "text"): # 有 text 属性就打印
                     print(block.text)
         print()  # 空行分隔
+
+
+"""
+采用 `文件即服务` 的设计思路，利用 JSONL 文件作为“邮箱”来实现进程间通信。
+
+**生命周期管理**
+    智能体不再是即用即弃，而是拥有状态流转：spawn (生成) -> WORKING (工作中) -> IDLE (空闲) -> SHUTDOWN (关闭)。
+    TeammateManager：负责维护 config.json（团队名册），管理队友的生成和状态。
+
+**通信机制：MessageBus**
+    基于 .team/inbox/ 目录下的 JSONL 文件。
+    发送 (send)：以“追加模式”向目标队友的 .jsonl 文件写入一行 JSON 数据。
+    接收 (read_inbox)：读取目标文件的所有内容，解析为 JSON 数组，并清空文件（Drain-on-read）。
+
+**运行逻辑**
+    主程序 启动领导智能体。
+    领导 可以调用工具 spawn 创建新线程运行队友智能体。
+    队友 在循环中运行，每次调用 LLM 前会检查自己的收件箱。
+    如果有新消息，将消息内容注入到 LLM 的上下文窗口中，队友据此做出反应。
+"""
