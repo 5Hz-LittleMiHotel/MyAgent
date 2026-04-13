@@ -341,15 +341,6 @@ class SkillLoader:
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
 
 
-# 系统提示词
-SYSTEM = f"""
-You are a coding agent at {WORKDIR}.
-Planning: Use the todo tool to plan multi-step tasks (mark as in_progress when starting, completed when done). Use the task tool to delegate exploration or subtasks. Use background_run for long-running commands.
-Knowledge: Use load_skill to access specialized knowledge for unfamiliar topics. Available skills: {SKILL_LOADER.get_descriptions()}.
-Behavior: Prefer using tools over generating prose.
-"""
-SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."""
-
 # %% ------------------------- compression -------------------------
 
 def estimate_tokens(messages: list) -> int:
@@ -753,11 +744,19 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+# %% ----------- TOOOLS, ToolMap and System prompt -----------
 
 # 工具列表(定义工具的名称、描述和输入格式)。模型会根据这个列表来决定调用哪个工具, 以及如何构造输入参数。
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+    {
+        "name": "bash",
+        "description": "Run a shell command in the current workspace.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
     {"name": "read_file", "description": "Read file contents.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
     {"name": "write_file", "description": "Write content to file.",
@@ -782,7 +781,6 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "check_background", "description": "Check background task status. Omit task_id to list all.",
      "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}}},
-
 ]
 
 
@@ -803,6 +801,16 @@ TOOL_HANDLERS = {
     "check_background": lambda **kw: BG.check(kw.get("task_id")),
 }
 
+# 系统提示词
+SYSTEM = f"""
+You are a coding agent at {WORKDIR}.
+Planning: Use the todo tool to plan multi-step tasks (mark as in_progress when starting, completed when done). 
+          Use the task tool to delegate exploration or subtasks. 
+          Use background_run for long-running commands.
+Knowledge: Use load_skill to access specialized knowledge for unfamiliar topics. Available skills: {SKILL_LOADER.get_descriptions()}.
+Behavior: Prefer using tools over generating prose.
+"""
+SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."""
 
 # %% ---------------- Agent loop with nag reminder injection ----------------
 
@@ -818,6 +826,16 @@ def agent_loop(messages: list):
             print("[auto_compact triggered]")
             messages[:] = auto_compact(messages)
         # ---------------- compact >>>>>>>>>>>>>>>>
+
+        # <<<<<<<<<<<<<<<< background_task ----------------
+        # Drain background notifications and inject as system message before LLM call
+        notifs = BG.drain_notifications()
+        if notifs and messages:
+            notif_text = "\n".join(
+                f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
+            )
+            messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>"})
+        # ---------------- background_task >>>>>>>>>>>>>>>>
 
         # 调用 LLM
         response = client.messages.create(
