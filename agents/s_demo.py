@@ -7,7 +7,9 @@ its own agent loop in a separate thread. Communication via append-only inboxes.
 每个队友都在独立的线程中运行自己的智能体循环。通过“仅追加”的收件箱进行通信。
 
     Subagent (s04):  spawn -> execute -> return summary -> destroyed
+                     生成 -> 执行 -> 返回总结 -> 销毁
     Teammate (s09):  spawn -> work -> idle -> work -> ... -> shutdown
+                     生成 -> 工作 -> 空闲 -> 工作 -> ... -> 关机
 
     .team/config.json                   .team/inbox/
     +----------------------------+      +------------------+
@@ -68,6 +70,8 @@ INBOX_DIR = TEAM_DIR / "inbox"
 THRESHOLD = 50000
 KEEP_RECENT = 3
 
+# %% ------------ MessageBus and TeammateManager ------------
+
 VALID_MSG_TYPES = {
     "message",
     "broadcast",
@@ -75,8 +79,6 @@ VALID_MSG_TYPES = {
     "shutdown_response",
     "plan_approval_response",
 }
-
-# %% ------------ MessageBus and TeammateManager ------------
 
 # -- MessageBus: JSONL inbox per teammate --
 # 消息总线：为每个“队友”提供一个基于JSONL文件的收件箱
@@ -87,8 +89,38 @@ class MessageBus:
         # 创建目录（如果不存在）
         self.dir.mkdir(parents=True, exist_ok=True)
 
+    # TODO: leader和sub都可以调用的工具，用于所有智能体间通信
     def send(self, sender: str, to: str, content: str,
              msg_type: str = "message", extra: dict = None) -> str:
+        """
+        msg_type: str = "message"
+        在智能体通信中，绝大多数情况（90%）都是普通的“聊天消息”。
+        如果每次发消息都要写 msg_type="message" 会很啰嗦。
+        当需要发送特殊指令（比如 broadcast，或者 shutdown_request）时，才需要指定。
+
+        # 情况 A：不传 msg_type，默认就是 "message"
+          BUS.send("alice", "bob", "你好")
+          BUS.send("alice", "bob", "你好", msg_type="message")
+
+        # 情况 B：显式指定 msg_type
+        BUS.send("lead", "alice", "所有人停止工作", msg_type="shutdown_request")
+        """
+
+        """
+        extra: dict 是一个“扩展槽”。
+        标准的消息体只需要 from, content, timestamp。
+        但有时候可能需要传递一些非标准的额外数据（比如任务的优先级、关联的文件名等）。
+        把它设为可选，是为了保持函数的灵活性。如果没有额外数据，就不传，保持消息体干净。
+
+        情况 A：不需要额外数据
+          BUS.send("alice", "bob", "代码写完了")
+          生成的 JSON: {"type": "message", "from": "alice", "content": "...", "timestamp": ...}
+
+        情况 B：需要带额外数据
+          BUS.send("alice", "bob", "任务完成", extra={"priority": "high", "file": "main.py"})
+          生成的 JSON: {"type": "message", ..., "priority": "high", "file": "main.py"}
+        """
+
         # 校验消息类型是否合法
         if msg_type not in VALID_MSG_TYPES:
             return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
@@ -113,8 +145,10 @@ class MessageBus:
             f.write(json.dumps(msg) + "\n")
 
         return f"Sent {msg_type} to {to}"
-
-    def read_inbox(self, name: str) -> list:
+    
+    # TODO: leader和sub都可以调用的工具
+    # 读取磁盘上属于该智能体的专属文件，读取之后，它会立即清空文件内容
+    def read_inbox(self, name: str) -> list:        
         # 获取指定用户的收件箱文件路径
         inbox_path = self.dir / f"{name}.jsonl"
 
@@ -134,8 +168,8 @@ class MessageBus:
 
         return messages
 
+    # 供leader使用，向所有队友广播（除了自己）
     def broadcast(self, sender: str, content: str, teammates: list) -> str:
-        # 向所有队友广播（除了自己）
         count = 0
 
         for name in teammates:
@@ -187,6 +221,7 @@ class TeammateManager:
                 return m
         return None
 
+    # 新建或征用一个子智能体，修改名单中的状态并运行它的loop
     def spawn(self, name: str, role: str, prompt: str) -> str:
         # 查找是否已有该成员
         member = self._find_member(name)
@@ -222,16 +257,29 @@ class TeammateManager:
 
         return f"Spawned '{name}' (role: {role})"
 
+    # 子智能体的loop
     def _teammate_loop(self, name: str, role: str, prompt: str):
+        """
+        在 s04 的架构中，子智能体就像一个研究员。
+            任务：父智能体派它去查资料。
+            过程：它查了很多文件，思考了很多。
+            输出：最后，它把所有发现总结成一段文字，返回给父智能体。
+            代码体现：run_subagent() 函数会 return 一个字符串摘要。
+
+        在 s09 的架构中，子智能体更像一个建筑工人。
+            任务：Lead 派它去“写一个登录页面”。
+            过程：它调用 write_file 工具，创建了 login.html。
+            输出：它的“输出”就是那个新创建的 login.html 文件！
+            代码体现：当它完成任务，不再调用工具时，循环 break，线程结束。没有 return 任何文字。
+        """
+
         # 系统提示词（定义智能体身份）
         sys_prompt = (
             f"You are '{name}', role: {role}, at {WORKDIR}. "
             f"Use send_message to communicate. Complete your task."
         )
-
         # 初始对话消息
         messages = [{"role": "user", "content": prompt}]
-
         # 可用工具列表
         tools = self._teammate_tools()
 
@@ -239,49 +287,36 @@ class TeammateManager:
         for _ in range(50):
             # 读取收件箱消息
             inbox = BUS.read_inbox(name)
-
             # 将消息加入上下文
             for msg in inbox:
                 messages.append({"role": "user", "content": json.dumps(msg)})
-
             try:
                 # 调用模型生成回复
                 response = client.messages.create(
-                    model=MODEL,
-                    system=sys_prompt,
-                    messages=messages,
-                    tools=tools,
-                    max_tokens=8000,
-                )
+                    model=MODEL,system=sys_prompt,messages=messages,
+                    tools=tools,max_tokens=8000,)
             except Exception:
                 # 出错直接退出循环
                 break
-
             # 将模型输出加入对话
             messages.append({"role": "assistant", "content": response.content})
-
             # 如果不是工具调用，则任务结束
             if response.stop_reason != "tool_use":
                 break
-
             results = []
-
             # 处理模型发起的工具调用
             for block in response.content:
                 if block.type == "tool_use":
                     # 执行工具
                     output = self._exec(name, block.name, block.input)
-
                     # 打印日志（调试用）
                     print(f"  [{name}] {block.name}: {str(output)[:120]}")
-
                     # 构造工具返回结果
                     results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
                         "content": str(output),
                     })
-
             # 将工具结果作为用户消息喂回模型（继续对话）
             messages.append({"role": "user", "content": results})
 
@@ -291,6 +326,7 @@ class TeammateManager:
             member["status"] = "idle"
             self._save_config()
 
+    # 子智能体的Handler
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
         # 执行不同工具（调度层）
 
@@ -320,6 +356,7 @@ class TeammateManager:
         # 未知工具
         return f"Unknown tool: {tool_name}"
 
+    # 子智能体的工具定义
     def _teammate_tools(self) -> list:
         # 定义模型可用的工具（函数调用 schema）
         return [
@@ -342,20 +379,17 @@ class TeammateManager:
              "input_schema": {"type": "object", "properties": {}}},
         ]
 
+    # 列出所有成员状态
     def list_all(self) -> str:
-        # 列出所有成员状态
         if not self.config["members"]:
             return "No teammates."
-
         lines = [f"Team: {self.config['team_name']}"]
-
         for m in self.config["members"]:
             lines.append(f"  {m['name']} ({m['role']}): {m['status']}")
-
         return "\n".join(lines)
 
+    # 返回所有成员名字列表，主智能体调用 broadcast 时作为参数
     def member_names(self) -> list:
-        # 返回所有成员名字列表
         return [m["name"] for m in self.config["members"]]
 
 
