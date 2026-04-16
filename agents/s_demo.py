@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# Harness: team mailboxes -- multiple models, coordinated through files.
 """
 s09_agent_teams.py - Agent Teams
 
@@ -930,7 +932,7 @@ class TodoManager:
                     }[item["status"]]
             lines.append(f"{marker} #{item['id']}: {item['text']}")
         done = sum(1 for t in self.items if t["status"] == "completed")
-        lines.append(f"\n({done}/{len(self.items)} completed)")
+        lines.append(f"({done}/{len(self.items)} completed)")
         return "\n".join(lines)
 
 TODO = TodoManager()
@@ -1193,7 +1195,7 @@ TOOL_HANDLERS = {
 
 # 系统提示词
 SYSTEM = f"""
-You are a coding agent and a team lead at {WORKDIR}. Spawn teammates and communicate via inboxes.
+You are a coding agent and a team lead at {WORKDIR} on a Windows Operating System. Spawn teammates and communicate via inboxes.
 Planning: Use the todo tool to plan multi-step tasks (mark as in_progress when starting, completed when done). 
           Use the task tool to delegate exploration or subtasks. 
           Use background_run for long-running commands.
@@ -1270,7 +1272,7 @@ def agent_loop(messages: list):
                         output = f"Error: {e}"
 
                 # 打印命令与部分输出
-                print(f"> {block.name}:")
+                print(f"\n> {block.name}:")
                 print(str(output)[:200])
                 # 收集结果
                 results.append({
@@ -1325,25 +1327,164 @@ if __name__ == "__main__":
         if isinstance(response_content, list): # 如果是结构化 block(列表)
             for block in response_content:
                 if hasattr(block, "text"): # 有 text 属性就打印
+                    print()
+                    print("----------------------this is the response----------------------")
                     print(block.text)
         print()  # 空行分隔
 
 
 """
-采用 `文件即服务` 的设计思路，利用 JSONL 文件作为“邮箱”来实现进程间通信。
+我在做智能体。但是智能体间通信出现了问题。具体而言，我让alice给bob发信息，
+但是实际上要么是bob给alice发（发信息的对象混了），要么是根本没发（两个智能体都是idle状态）。
+下面是日志（根本没发的情况），请你把这两个问题总结出来，并给出可能的原因：
 
-**生命周期管理**
-    智能体不再是即用即弃，而是拥有状态流转：spawn (生成) -> WORKING (工作中) -> IDLE (空闲) -> SHUTDOWN (关闭)。
-    TeammateManager：负责维护 config.json（团队名册），管理队友的生成和状态。
+s01 >> send bob a message, ask some boring question to him
 
-**通信机制：MessageBus**
-    基于 .team/inbox/ 目录下的 JSONL 文件。
-    发送 (send)：以“追加模式”向目标队友的 .jsonl 文件写入一行 JSON 数据。
-    接收 (read_inbox)：读取目标文件的所有内容，解析为 JSON 数组，并清空文件（Drain-on-read）。
+    > send_message:
+        Sent message to Bob
+        Message sent to Bob! I asked him about his preferred method for documenting test cases - a classic boring but practical question for a testing specialist. Bob should receive this message and can respond when he's active.
 
-**运行逻辑**
-    主程序 启动领导智能体。
-    领导 可以调用工具 spawn 创建新线程运行队友智能体。
-    队友 在循环中运行，每次调用 LLM 前会检查自己的收件箱。
-    如果有新消息，将消息内容注入到 LLM 的上下文窗口中，队友据此做出反应。
+s01 >> and now, let alice send a question to bob, ask him if 1 plus 1 is equal to 2, and send the answer to leader, that is you.
+
+    > send_message:
+        Sent message to Alice
+
+    > read_inbox:
+        []
+        The inbox is currently empty. Alice will need to send the message to Bob first, wait for his response, and then forward it to me. This may take a moment as both teammates need to process the messages.
+
+s01 >> why alice do not send the message? i can not read the message in bob's jsonl.
+
+    > list_teammates:
+        Team: default
+        Alice (Coding Specialist): idle
+        Bob (Testing Specialist): idle
+
+    > check_background:
+        No background tasks.
+
+    > bash:
+        'ls' 不是内部或外部命令，也不是可运行的程序
+        或批处理文件。
+
+    > todo:
+        [x] #1: Spawn Alice (coding teammate)
+        [x] #2: Spawn Bob (testing teammate)
+        [x] #3: Ask Alice to send message to Bob
+        [x] #4: Send boring question to Bob
+        [>] #5: Instruct Alice to ask Bob about 1+1=2 an
+
+    > bash:
+
+    > todo:
+        [x] #1: Spawn Alice (coding teammate)
+        [x] #2: Spawn Bob (testing teammate)
+        [x] #3: Ask Alice to send message to Bob
+        [x] #4: Send boring question to Bob
+        [x] #5: Instruct Alice to ask Bob about 1+1=2 an
+
+    > read_file:
+        {"type": "message", "from": "lead", "content": "Please send a message to Bob introducing yourself and letting him know you're ready to collaborate on coding projects. Tell him you're the coding specia    
+
+    > read_file:
+        {"type": "message", "from": "lead", "content": "Hey Bob, I have a really boring question for you. What's your preferred method for documenting test cases? Do you prefer spreadsheets, specialized testi    
+
+    > bash:
+
+    > todo:
+        [x] #1: Spawn Alice (coding teammate)
+        [x] #2: Spawn Bob (testing teammate)
+        [x] #3: Ask Alice to send message to Bob
+        [x] #4: Send boring question to Bob
+        [x] #5: Instruct Alice to ask Bob about 1+1=2 an
+
+    > read_file:
+        {
+        "team_name": "default",
+        "members": [
+            {
+            "name": "Alice",
+            "role": "Coding Specialist",
+            "status": "idle"
+            },
+            {
+            "name": "Bob",
+            "role": "Testing Specialist",
+
+
+    > bash:
+
+    > read_file:
+        {"type": "message", "from": "lead", "content": "Please send a message to Bob introducing yourself and letting him know you're ready to collaborate on coding projects. Tell him you're the coding specia    
+
+    > todo:
+        [x] #1: Spawn Alice (coding teammate)
+        [x] #2: Spawn Bob (testing teammate)
+        [x] #3: Ask Alice to send message to Bob
+        [x] #4: Send boring question to Bob
+        [x] #5: Instruct Alice to ask Bob about 1+1=2 an
+
+    > read_file:
+        {"type": "message", "from": "lead", "content": "Hey Bob, I have a really boring question for you. What's your preferred method for documenting test cases? Do you prefer spreadsheets, specialized testi    
+
+——————————————————————————————————————————————————————————————————————
+
+Good! Bob has received my boring question in his inbox. However, like Alice, he's also idle and not processing messages.
+
+The system appears to be set up where:
+1. Messages are stored in JSONL files in the `.team/inbox/` directory
+2. Teammates need to be activated to process these messages
+3. Currently both Alice and Bob are spawned but idle
+
+To get Alice to send a message to Bob, we would need to either:
+1. Activate Alice to process her inbox
+2. Or have a different mechanism to trigger message processing
+
+Since the system shows them as "idle", they likely need to be started or triggered in some way to begin processing their message queues.
+
+s01 >> 
+
+大模型给出的问题总结（表象，但本质出错！）：
+
+问题1：消息发送对象错乱（Alice ↔ Bob 混淆）
+表现：
+    你说「让 Alice 给 Bob 发消息」
+实际日志：
+    > send_message:
+    Sent message to Alice
+    或者出现“Bob 发给 Alice”的情况
+👉 本质：调用层的“目标对象”和“执行者”没有绑定清楚
+
+问题2：消息根本没有发送（系统卡在 idle）
+表现：
+    read_inbox: []（收件箱空）
+    .team/inbox 里没有 Bob 的文件
+list_teammates 显示：
+    Alice: idle
+    Bob: idle
+日志明确说：
+    both teammates are idle and not processing messages
+👉 本质：消息机制是“被动处理”的，但没有触发执行
+
+我的回复：
+    对啊，我的意思就是，告诉lead，让lead给alice发消息，消息内容是给bob发个消息并返回给lead。其实是我->lead->alice->bob->lead。
+    而且你说的那个“> send_message:Sent message to Alice”，实际上alice.jsonl中确实出现了这一行：{"type": "message", "from": "lead", "content": "Please send a message to Bob asking him: \"Is 1 plus 1 equal to 2?\" Then, when Bob responds with the answer, please forward his response to me (the leader).", "timestamp": 1776337283.467061} 。
+    显然，lead给alice发消息没问题。关键是alice没执行，也因此bob的jsonl中仅仅出现了之前lead给的内容：{"type": "message", "from": "lead", "content": "Hey Bob, I have a really boring question for you. What's your preferred method for documenting test cases? Do you prefer spreadsheets, specialized testing tools, or something else entirely?", "timestamp": 1776337139.0233955} 。
+    我认为是你搞混了执行者。即使你说到动作空间冲突，确实是一个值得思考的点。
+    所以其实，感觉两个原因都要归因于，teammateloop设计的不合理，导致他们在idle状态。
+
+最后发现确实我的想法是正确的。
+
+但是，了解了为什么子智能体会没发出信息，那为什么发件人和收件人会发错？
+    一开始我以为是工具太多、或是三层压缩使模型出现了幻觉。但是chatGPT给我的答案是，工具多的问题不在“幻觉”，而在：动作空间冲突（action ambiguity）
+    也就是：
+        现在至少有这些隐含动作：
+            * 直接发消息
+            * 让别人发消息（meta）
+            * 多跳任务（Alice → Bob → leader）
+        但目前只有一个工具：send_message(to, content)
+        这会导致：多个语义 → 一个工具
+        结果就是：
+            LLM只能选一个最接近的：“那我就发给 Alice 吧”
+            
 """

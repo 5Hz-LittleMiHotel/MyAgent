@@ -932,7 +932,7 @@ class TodoManager:
                     }[item["status"]]
             lines.append(f"{marker} #{item['id']}: {item['text']}")
         done = sum(1 for t in self.items if t["status"] == "completed")
-        lines.append(f"\n({done}/{len(self.items)} completed)")
+        lines.append(f"({done}/{len(self.items)} completed)")
         return "\n".join(lines)
 
 TODO = TodoManager()
@@ -1195,7 +1195,7 @@ TOOL_HANDLERS = {
 
 # 系统提示词
 SYSTEM = f"""
-You are a coding agent and a team lead at {WORKDIR}. Spawn teammates and communicate via inboxes.
+You are a coding agent and a team lead at {WORKDIR} on a windows operating system. Spawn teammates and communicate via inboxes.
 Planning: Use the todo tool to plan multi-step tasks (mark as in_progress when starting, completed when done). 
           Use the task tool to delegate exploration or subtasks. 
           Use background_run for long-running commands.
@@ -1272,7 +1272,7 @@ def agent_loop(messages: list):
                         output = f"Error: {e}"
 
                 # 打印命令与部分输出
-                print(f"> {block.name}:")
+                print(f"\n> {block.name}:")
                 print(str(output)[:200])
                 # 收集结果
                 results.append({
@@ -1327,25 +1327,30 @@ if __name__ == "__main__":
         if isinstance(response_content, list): # 如果是结构化 block(列表)
             for block in response_content:
                 if hasattr(block, "text"): # 有 text 属性就打印
+                    print()
+                    print("----------------------this is the response----------------------")
                     print(block.text)
         print()  # 空行分隔
 
 
 """
-采用 `文件即服务` 的设计思路，利用 JSONL 文件作为“邮箱”来实现进程间通信。
+问题1：消息发送对象错乱（Alice ↔ Bob 混淆）
+表现：
+    你说「让 Alice 给 Bob 发消息」
+实际日志：
+    > send_message:
+    Sent message to Alice
+    或者出现“Bob 发给 Alice”的情况
+👉 本质：调用层的“目标对象”和“执行者”没有绑定清楚
 
-**生命周期管理**
-    智能体不再是即用即弃，而是拥有状态流转：spawn (生成) -> WORKING (工作中) -> IDLE (空闲) -> SHUTDOWN (关闭)。
-    TeammateManager：负责维护 config.json（团队名册），管理队友的生成和状态。
-
-**通信机制：MessageBus**
-    基于 .team/inbox/ 目录下的 JSONL 文件。
-    发送 (send)：以“追加模式”向目标队友的 .jsonl 文件写入一行 JSON 数据。
-    接收 (read_inbox)：读取目标文件的所有内容，解析为 JSON 数组，并清空文件（Drain-on-read）。
-
-**运行逻辑**
-    主程序 启动领导智能体。
-    领导 可以调用工具 spawn 创建新线程运行队友智能体。
-    队友 在循环中运行，每次调用 LLM 前会检查自己的收件箱。
-    如果有新消息，将消息内容注入到 LLM 的上下文窗口中，队友据此做出反应。
+问题2：消息根本没有发送（系统卡在 idle）
+表现：
+    read_inbox: []（收件箱空）
+    .team/inbox 里没有 Bob 的文件
+list_teammates 显示：
+    Alice: idle
+    Bob: idle
+日志明确说：
+    both teammates are idle and not processing messages
+👉 本质：消息机制是“被动处理”的，但没有触发执行
 """
