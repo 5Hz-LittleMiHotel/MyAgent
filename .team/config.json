@@ -3,12 +3,12 @@
   "members": [
     {
       "name": "Alice",
-      "role": "Coding Specialist",
+      "role": "coder",
       "status": "idle"
     },
     {
       "name": "Bob",
-      "role": "Testing Specialist",
+      "role": "tester",
       "status": "idle"
     }
   ]

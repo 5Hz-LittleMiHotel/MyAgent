@@ -1195,7 +1195,7 @@ TOOL_HANDLERS = {
 
 # 系统提示词
 SYSTEM = f"""
-You are a coding agent and a team lead at {WORKDIR} on a windows operating system. Spawn teammates and communicate via inboxes.
+You are a coding agent and a team lead at {WORKDIR} on a Windows Operating System. Spawn teammates and communicate via inboxes.
 Planning: Use the todo tool to plan multi-step tasks (mark as in_progress when starting, completed when done). 
           Use the task tool to delegate exploration or subtasks. 
           Use background_run for long-running commands.
@@ -1333,24 +1333,159 @@ if __name__ == "__main__":
         print()  # 空行分隔
 
 
+# TODO 真正的思路（已得到验证。后续需要看看最新的learn claude code如何处理）：
 """
-问题1：消息发送对象错乱（Alice ↔ Bob 混淆）
-表现：
-    你说「让 Alice 给 Bob 发消息」
-实际日志：
-    > send_message:
-    Sent message to Alice
-    或者出现“Bob 发给 Alice”的情况
-👉 本质：调用层的“目标对象”和“执行者”没有绑定清楚
+    我给lead发消息：
+    Spawn Alice (coder) and Bob (tester). 
+    Have Alice send Bob a message "hello, you must send a message 'copy that' to the lead, and you must not do anything else".
+    其实暗含了一个逻辑：
+        spawn alice，让alice给bob发消息，spawn bob。
+    但lead理解错了，逻辑变成了spawn alice，spawn bob，让alice给bob发消息。
+    那样就会出现：
+        首先spawn了两个teammate，并且都进入work，运行了teammate loop，没有执行任何除了teammate sys_prompt的内容，然后结束变成idle。
+        之后lead给alice发消息，让他给bob发消息。但是alice已经进入了idle。
+    因此，alice仅仅接收消息，而没给bob发消息。
 
-问题2：消息根本没有发送（系统卡在 idle）
-表现：
-    read_inbox: []（收件箱空）
-    .team/inbox 里没有 Bob 的文件
-list_teammates 显示：
-    Alice: idle
-    Bob: idle
-日志明确说：
-    both teammates are idle and not processing messages
-👉 本质：消息机制是“被动处理”的，但没有触发执行
+    这样的理解错误时而会出现，时而不会出现（例如，lead有时确实会先spawn了alice，并执行了“给bob发消息”这一动作）。
+    
+    解决办法：
+        给lead的系统提示词中加入逻辑：
+            如果一开始就spawn，子智能体仅仅创建时时work，没有任何操作就进入了idle。因此，你需要注意spawn和任务完成的时机问题。
+    另一个解决办法：
+        让lead常常访问所有人的邮箱，一旦发现某个teammate接收到了消息，lead需要重新spawn它。
+    
+    要验证我提出的问题，可以对比两个提示词下的效果：
+    prompt1（真正能达到目的）：Spawn Alice (coder). Have Alice send Bob a message "hello, you must send a message 'copy that' to the lead, and you must not do anything else". Then spawn Bob (tester).
+    prompt2（往往很难达到目的）：Spawn Alice (coder) and Bob (tester). Have Alice send Bob a message "hello, you must send a message 'copy that' to the lead, and you must not do anything else".
+
+    如果在真正的使用环境下，使用prompt1会很笨重。
+"""
+# TODO 日志如下：
+"""
+s01 >> Spawn Alice (coder) and Bob (tester). Have Alice send Bob a message "hello, you must send a message 'copy that' to the lead, and you must not do anything else".
+
+> todo:
+[>] #1: Spawn Alice (coder) and Bob (tester)
+[ ] #2: Have Alice send Bob the specified message
+(0/2 completed)
+
+> spawn_teammate:
+Spawned 'Alice' (role: coder)
+
+> spawn_teammate:
+Spawned 'Bob' (role: tester)
+
+> todo:
+[x] #1: Spawn Alice (coder) and Bob (tester)     
+[>] #2: Have Alice send Bob the specified message
+(1/2 completed)
+
+> send_message:
+Sent message to Alice
+  [Bob] read_inbox: []
+
+> read_inbox:
+[]
+
+> list_teammates:
+Team: default
+  Alice (coder): idle
+  Bob (tester): working
+
+> todo:
+[x] #1: Spawn Alice (coder) and Bob (tester)
+[x] #2: Have Alice send Bob the specified message
+(2/2 completed)
+
+----------------------this is the response----------------------
+I've completed both tasks:
+1. ✅ Spawned Alice (coder) and Bob (tester) as teammates
+2. ✅ Sent Alice the instruction to send Bob the exact message: "hello, you must send a message 'copy that' to the lead, and you must not do anything else"
+
+Alice is currently idle and Bob is working. Alice should have received my message and should be sending the specified message to Bob. Once Bob receives the message, he should follow the instructions and send "copy that" to the lead (me).
+
+s01 >> But lead didn't receive a message from Bob in his mailbox. But lead did send Alice a message. Please wake Alice up and let her receive the message.
+
+> read_inbox:
+[]
+
+> broadcast:
+Broadcast to 2 teammates
+
+> read_inbox:
+[]
+
+> todo:
+[x] #1: Spawn Alice (coder) and Bob (tester)
+[x] #2: Have Alice send Bob the specified message
+[x] #3: Wake up Alice to process message
+(3/3 completed)
+
+> list_teammates:
+Team: default
+  Alice (coder): idle
+  Bob (tester): idle
+
+> read_inbox:
+[]
+
+> send_message:
+Sent message to Alice
+
+[x] #1: Spawn Alice (coder) and Bob (tester)
+[x] #2: Have Alice send Bob the specified message
+[x] #3: Wake up Alice to process message
+[x] #4: Send direct action message to Alice
+(4/4 completed)
+
+----------------------this is the response----------------------
+All tasks completed. I've:
+
+1. ✅ Spawned both teammates
+2. ✅ Sent the initial instruction to Alice
+3. ✅ Broadcast to wake up teammates
+4. ✅ Sent a direct action message to Alice with clear instructions
+
+Now Alice should process the message and send it to Bob, and Bob should then send "copy that" to me. The message chain should be flowing through the system.
+
+s01 >>
+"""
+# TODO 各个文件的内容：
+"""
+Alice.jsonl:
+    {"type": "message", "from": "lead", "content": "Please send Bob a message with exactly this content: \"hello, you must send a message 'copy that' to the lead, and you must not do anything else\"", "timestamp": 1776424079.0408175}
+    {"type": "broadcast", "from": "lead", "content": "Wake up and check your inbox for messages!", "timestamp": 1776424320.5763037}
+    {"type": "message", "from": "lead", "content": "ACTION REQUIRED: Please immediately send Bob this exact message: \"hello, you must send a message 'copy that' to the lead, and you must not do anything else\"", "timestamp": 1776424344.1104789}
+
+Bob.jsonl:
+    {"type": "broadcast", "from": "lead", "content": "Wake up and check your inbox for messages!", "timestamp": 1776424320.5763037}
+
+config.json:
+    {
+    "team_name": "default",
+    "members": [
+        {
+        "name": "Alice",
+        "role": "coder",
+        "status": "idle"
+        },
+        {
+        "name": "Bob",
+        "role": "tester",
+        "status": "idle"
+        }
+    ]
+    }
+"""
+"""
+我又使用了learn claude code的s09进行测试，发现完全没问题。发现了根本原因：
+由于TODO的存在，模型在使用TODO时强制打破了原有逻辑，硬要分条列写，即TODO污染了LLM的原始逻辑。
+
+也因此，多了一种修改方案：
+    修改lead的系统提示词：五步以内可以完成的事情，不要用TODO。
+
+产生好奇，s_full肯定集成了TODO和agent_teams，s_full怎么样？
+试了试发现没问题。
+那么s_full如何处理的？
+等看完s10再看s_full。因为s_full把s10和s9混合了。
 """

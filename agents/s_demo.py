@@ -1333,158 +1333,159 @@ if __name__ == "__main__":
         print()  # 空行分隔
 
 
+# TODO 真正的思路（已得到验证。后续需要看看最新的learn claude code如何处理）：
 """
-我在做智能体。但是智能体间通信出现了问题。具体而言，我让alice给bob发信息，
-但是实际上要么是bob给alice发（发信息的对象混了），要么是根本没发（两个智能体都是idle状态）。
-下面是日志（根本没发的情况），请你把这两个问题总结出来，并给出可能的原因：
+    我给lead发消息：
+    Spawn Alice (coder) and Bob (tester). 
+    Have Alice send Bob a message "hello, you must send a message 'copy that' to the lead, and you must not do anything else".
+    其实暗含了一个逻辑：
+        spawn alice，让alice给bob发消息，spawn bob。
+    但lead理解错了，逻辑变成了spawn alice，spawn bob，让alice给bob发消息。
+    那样就会出现：
+        首先spawn了两个teammate，并且都进入work，运行了teammate loop，没有执行任何除了teammate sys_prompt的内容，然后结束变成idle。
+        之后lead给alice发消息，让他给bob发消息。但是alice已经进入了idle。
+    因此，alice仅仅接收消息，而没给bob发消息。
 
-s01 >> send bob a message, ask some boring question to him
+    这样的理解错误时而会出现，时而不会出现（例如，lead有时确实会先spawn了alice，并执行了“给bob发消息”这一动作）。
+    
+    解决办法：
+        给lead的系统提示词中加入逻辑：
+            如果一开始就spawn，子智能体仅仅创建时时work，没有任何操作就进入了idle。因此，你需要注意spawn和任务完成的时机问题。
+    另一个解决办法：
+        让lead常常访问所有人的邮箱，一旦发现某个teammate接收到了消息，lead需要重新spawn它。
+    
+    要验证我提出的问题，可以对比两个提示词下的效果：
+    prompt1（真正能达到目的）：Spawn Alice (coder). Have Alice send Bob a message "hello, you must send a message 'copy that' to the lead, and you must not do anything else". Then spawn Bob (tester).
+    prompt2（往往很难达到目的）：Spawn Alice (coder) and Bob (tester). Have Alice send Bob a message "hello, you must send a message 'copy that' to the lead, and you must not do anything else".
 
-    > send_message:
-        Sent message to Bob
-        Message sent to Bob! I asked him about his preferred method for documenting test cases - a classic boring but practical question for a testing specialist. Bob should receive this message and can respond when he's active.
+    如果在真正的使用环境下，使用prompt1会很笨重。
+"""
+# TODO 日志如下：
+"""
+s01 >> Spawn Alice (coder) and Bob (tester). Have Alice send Bob a message "hello, you must send a message 'copy that' to the lead, and you must not do anything else".
 
-s01 >> and now, let alice send a question to bob, ask him if 1 plus 1 is equal to 2, and send the answer to leader, that is you.
+> todo:
+[>] #1: Spawn Alice (coder) and Bob (tester)
+[ ] #2: Have Alice send Bob the specified message
+(0/2 completed)
 
-    > send_message:
-        Sent message to Alice
+> spawn_teammate:
+Spawned 'Alice' (role: coder)
 
-    > read_inbox:
-        []
-        The inbox is currently empty. Alice will need to send the message to Bob first, wait for his response, and then forward it to me. This may take a moment as both teammates need to process the messages.
+> spawn_teammate:
+Spawned 'Bob' (role: tester)
 
-s01 >> why alice do not send the message? i can not read the message in bob's jsonl.
+> todo:
+[x] #1: Spawn Alice (coder) and Bob (tester)     
+[>] #2: Have Alice send Bob the specified message
+(1/2 completed)
 
-    > list_teammates:
-        Team: default
-        Alice (Coding Specialist): idle
-        Bob (Testing Specialist): idle
+> send_message:
+Sent message to Alice
+  [Bob] read_inbox: []
 
-    > check_background:
-        No background tasks.
+> read_inbox:
+[]
 
-    > bash:
-        'ls' 不是内部或外部命令，也不是可运行的程序
-        或批处理文件。
+> list_teammates:
+Team: default
+  Alice (coder): idle
+  Bob (tester): working
 
-    > todo:
-        [x] #1: Spawn Alice (coding teammate)
-        [x] #2: Spawn Bob (testing teammate)
-        [x] #3: Ask Alice to send message to Bob
-        [x] #4: Send boring question to Bob
-        [>] #5: Instruct Alice to ask Bob about 1+1=2 an
+> todo:
+[x] #1: Spawn Alice (coder) and Bob (tester)
+[x] #2: Have Alice send Bob the specified message
+(2/2 completed)
 
-    > bash:
+----------------------this is the response----------------------
+I've completed both tasks:
+1. ✅ Spawned Alice (coder) and Bob (tester) as teammates
+2. ✅ Sent Alice the instruction to send Bob the exact message: "hello, you must send a message 'copy that' to the lead, and you must not do anything else"
 
-    > todo:
-        [x] #1: Spawn Alice (coding teammate)
-        [x] #2: Spawn Bob (testing teammate)
-        [x] #3: Ask Alice to send message to Bob
-        [x] #4: Send boring question to Bob
-        [x] #5: Instruct Alice to ask Bob about 1+1=2 an
+Alice is currently idle and Bob is working. Alice should have received my message and should be sending the specified message to Bob. Once Bob receives the message, he should follow the instructions and send "copy that" to the lead (me).
 
-    > read_file:
-        {"type": "message", "from": "lead", "content": "Please send a message to Bob introducing yourself and letting him know you're ready to collaborate on coding projects. Tell him you're the coding specia    
+s01 >> But lead didn't receive a message from Bob in his mailbox. But lead did send Alice a message. Please wake Alice up and let her receive the message.
 
-    > read_file:
-        {"type": "message", "from": "lead", "content": "Hey Bob, I have a really boring question for you. What's your preferred method for documenting test cases? Do you prefer spreadsheets, specialized testi    
+> read_inbox:
+[]
 
-    > bash:
+> broadcast:
+Broadcast to 2 teammates
 
-    > todo:
-        [x] #1: Spawn Alice (coding teammate)
-        [x] #2: Spawn Bob (testing teammate)
-        [x] #3: Ask Alice to send message to Bob
-        [x] #4: Send boring question to Bob
-        [x] #5: Instruct Alice to ask Bob about 1+1=2 an
+> read_inbox:
+[]
 
-    > read_file:
+> todo:
+[x] #1: Spawn Alice (coder) and Bob (tester)
+[x] #2: Have Alice send Bob the specified message
+[x] #3: Wake up Alice to process message
+(3/3 completed)
+
+> list_teammates:
+Team: default
+  Alice (coder): idle
+  Bob (tester): idle
+
+> read_inbox:
+[]
+
+> send_message:
+Sent message to Alice
+
+[x] #1: Spawn Alice (coder) and Bob (tester)
+[x] #2: Have Alice send Bob the specified message
+[x] #3: Wake up Alice to process message
+[x] #4: Send direct action message to Alice
+(4/4 completed)
+
+----------------------this is the response----------------------
+All tasks completed. I've:
+
+1. ✅ Spawned both teammates
+2. ✅ Sent the initial instruction to Alice
+3. ✅ Broadcast to wake up teammates
+4. ✅ Sent a direct action message to Alice with clear instructions
+
+Now Alice should process the message and send it to Bob, and Bob should then send "copy that" to me. The message chain should be flowing through the system.
+
+s01 >>
+"""
+# TODO 各个文件的内容：
+"""
+Alice.jsonl:
+    {"type": "message", "from": "lead", "content": "Please send Bob a message with exactly this content: \"hello, you must send a message 'copy that' to the lead, and you must not do anything else\"", "timestamp": 1776424079.0408175}
+    {"type": "broadcast", "from": "lead", "content": "Wake up and check your inbox for messages!", "timestamp": 1776424320.5763037}
+    {"type": "message", "from": "lead", "content": "ACTION REQUIRED: Please immediately send Bob this exact message: \"hello, you must send a message 'copy that' to the lead, and you must not do anything else\"", "timestamp": 1776424344.1104789}
+
+Bob.jsonl:
+    {"type": "broadcast", "from": "lead", "content": "Wake up and check your inbox for messages!", "timestamp": 1776424320.5763037}
+
+config.json:
+    {
+    "team_name": "default",
+    "members": [
         {
-        "team_name": "default",
-        "members": [
-            {
-            "name": "Alice",
-            "role": "Coding Specialist",
-            "status": "idle"
-            },
-            {
-            "name": "Bob",
-            "role": "Testing Specialist",
+        "name": "Alice",
+        "role": "coder",
+        "status": "idle"
+        },
+        {
+        "name": "Bob",
+        "role": "tester",
+        "status": "idle"
+        }
+    ]
+    }
+"""
+"""
+我又使用了learn claude code的s09进行测试，发现完全没问题。发现了根本原因：
+由于TODO的存在，模型在使用TODO时强制打破了原有逻辑，硬要分条列写，即TODO污染了LLM的原始逻辑。
 
+也因此，多了一种修改方案：
+    修改lead的系统提示词：五步以内可以完成的事情，不要用TODO。
 
-    > bash:
-
-    > read_file:
-        {"type": "message", "from": "lead", "content": "Please send a message to Bob introducing yourself and letting him know you're ready to collaborate on coding projects. Tell him you're the coding specia    
-
-    > todo:
-        [x] #1: Spawn Alice (coding teammate)
-        [x] #2: Spawn Bob (testing teammate)
-        [x] #3: Ask Alice to send message to Bob
-        [x] #4: Send boring question to Bob
-        [x] #5: Instruct Alice to ask Bob about 1+1=2 an
-
-    > read_file:
-        {"type": "message", "from": "lead", "content": "Hey Bob, I have a really boring question for you. What's your preferred method for documenting test cases? Do you prefer spreadsheets, specialized testi    
-
-——————————————————————————————————————————————————————————————————————
-
-Good! Bob has received my boring question in his inbox. However, like Alice, he's also idle and not processing messages.
-
-The system appears to be set up where:
-1. Messages are stored in JSONL files in the `.team/inbox/` directory
-2. Teammates need to be activated to process these messages
-3. Currently both Alice and Bob are spawned but idle
-
-To get Alice to send a message to Bob, we would need to either:
-1. Activate Alice to process her inbox
-2. Or have a different mechanism to trigger message processing
-
-Since the system shows them as "idle", they likely need to be started or triggered in some way to begin processing their message queues.
-
-s01 >> 
-
-大模型给出的问题总结（表象，但本质出错！）：
-
-问题1：消息发送对象错乱（Alice ↔ Bob 混淆）
-表现：
-    你说「让 Alice 给 Bob 发消息」
-实际日志：
-    > send_message:
-    Sent message to Alice
-    或者出现“Bob 发给 Alice”的情况
-👉 本质：调用层的“目标对象”和“执行者”没有绑定清楚
-
-问题2：消息根本没有发送（系统卡在 idle）
-表现：
-    read_inbox: []（收件箱空）
-    .team/inbox 里没有 Bob 的文件
-list_teammates 显示：
-    Alice: idle
-    Bob: idle
-日志明确说：
-    both teammates are idle and not processing messages
-👉 本质：消息机制是“被动处理”的，但没有触发执行
-
-我的回复：
-    对啊，我的意思就是，告诉lead，让lead给alice发消息，消息内容是给bob发个消息并返回给lead。其实是我->lead->alice->bob->lead。
-    而且你说的那个“> send_message:Sent message to Alice”，实际上alice.jsonl中确实出现了这一行：{"type": "message", "from": "lead", "content": "Please send a message to Bob asking him: \"Is 1 plus 1 equal to 2?\" Then, when Bob responds with the answer, please forward his response to me (the leader).", "timestamp": 1776337283.467061} 。
-    显然，lead给alice发消息没问题。关键是alice没执行，也因此bob的jsonl中仅仅出现了之前lead给的内容：{"type": "message", "from": "lead", "content": "Hey Bob, I have a really boring question for you. What's your preferred method for documenting test cases? Do you prefer spreadsheets, specialized testing tools, or something else entirely?", "timestamp": 1776337139.0233955} 。
-    我认为是你搞混了执行者。即使你说到动作空间冲突，确实是一个值得思考的点。
-    所以其实，感觉两个原因都要归因于，teammateloop设计的不合理，导致他们在idle状态。
-
-最后发现确实我的想法是正确的。
-
-但是，了解了为什么子智能体会没发出信息，那为什么发件人和收件人会发错？
-    一开始我以为是工具太多、或是三层压缩使模型出现了幻觉。但是chatGPT给我的答案是，工具多的问题不在“幻觉”，而在：动作空间冲突（action ambiguity）
-    也就是：
-        现在至少有这些隐含动作：
-            * 直接发消息
-            * 让别人发消息（meta）
-            * 多跳任务（Alice → Bob → leader）
-        但目前只有一个工具：send_message(to, content)
-        这会导致：多个语义 → 一个工具
-        结果就是：
-            LLM只能选一个最接近的：“那我就发给 Alice 吧”
-            
+产生好奇，s_full肯定集成了TODO和agent_teams，s_full怎么样？
+试了试发现没问题。
+那么s_full如何处理的？
+等看完s10再看s_full。因为s_full把s10和s9混合了。
 """
