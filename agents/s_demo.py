@@ -1,51 +1,52 @@
 #!/usr/bin/env python3
-# Harness: team mailboxes -- multiple models, coordinated through files.
+# Harness: protocols -- structured handshakes between models.
 """
-s09_agent_teams.py - Agent Teams
+s10_team_protocols.py - Team Protocols
 
-Persistent named agents with file-based JSONL inboxes. Each teammate runs
-拥有基于文件的 JSONL 收件箱的、持久化且具名的智能体。
-its own agent loop in a separate thread. Communication via append-only inboxes.
-每个队友都在独立的线程中运行自己的智能体循环。通过“仅追加”的收件箱进行通信。
+Shutdown protocol and plan approval protocol, both using the same
+request_id correlation pattern. Builds on s09's team messaging.
 
-    Subagent (s04):  spawn -> execute -> return summary -> destroyed
-                     生成 -> 执行 -> 返回总结 -> 销毁
-    Teammate (s09):  spawn -> work -> idle -> work -> ... -> shutdown
-                     生成 -> 工作 -> 空闲 -> 工作 -> ... -> 关机
+    Shutdown FSM: pending -> approved | rejected
 
-    .team/config.json                   .team/inbox/
-    +----------------------------+      +------------------+
-    | {"team_name": "default",   |      | alice.jsonl      |
-    |  "members": [              |      | bob.jsonl        |
-    |    {"name":"alice",        |      | lead.jsonl       |
-    |     "role":"coder",        |      +------------------+
-    |     "status":"idle"}       |
-    |  ]}                        |      send_message("alice", "fix bug"):
-    +----------------------------+        open("alice.jsonl", "a").write(msg)
+    Lead                              Teammate
+    +---------------------+          +---------------------+
+    | shutdown_request    |          |                     |
+    | {                   | -------> | receives request    |
+    |   request_id: abc   |          | decides: approve?   |
+    | }                   |          |                     |
+    +---------------------+          +---------------------+
+                                             |
+    +---------------------+          +-------v-------------+
+    | shutdown_response   | <------- | shutdown_response   |
+    | {                   |          | {                   |
+    |   request_id: abc   |          |   request_id: abc   |
+    |   approve: true     |          |   approve: true     |
+    | }                   |          | }                   |
+    +---------------------+          +---------------------+
+            |
+            v
+    status -> "shutdown", thread stops
 
-                                        read_inbox("alice"):
-    spawn_teammate("alice","coder",...)   msgs = [json.loads(l) for l in ...]
-         |                                open("alice.jsonl", "w").close()
-         v                                return msgs  # drain
-    Thread: alice             Thread: bob
-    +------------------+      +------------------+
-    | agent_loop       |      | agent_loop       |
-    | status: working  |      | status: idle     |
-    | ... runs tools   |      | ... waits ...    |
-    | status -> idle   |      |                  |
-    +------------------+      +------------------+
+    Plan approval FSM: pending -> approved | rejected
 
-    5 message types (all declared, not all handled here):
-    +-------------------------+-----------------------------------+
-    | message                 | Normal text message               |
-    | broadcast               | Sent to all teammates             |
-    | shutdown_request        | Request graceful shutdown (s10)   |
-    | shutdown_response       | Approve/reject shutdown (s10)     |
-    | plan_approval_response  | Approve/reject plan (s10)         |
-    +-------------------------+-----------------------------------+
+    Teammate                          Lead
+    +---------------------+          +---------------------+
+    | plan_approval       |          |                     |
+    | submit: {plan:"..."}| -------> | reviews plan text   |
+    +---------------------+          | approve/reject?     |
+                                     +---------------------+
+                                             |
+    +---------------------+          +-------v-------------+
+    | plan_approval_resp  | <------- | plan_approval       |
+    | {approve: true}     |          | review: {req_id,    |
+    +---------------------+         |   approve: true}     |
+                                     +---------------------+
 
-Key insight: "Teammates that can talk to each other."
+    Trackers: {request_id: {"target|from": name, "status": "pending|..."}}
+
+Key insight: "Same request_id correlation pattern, two domains."
 """
+
 import json
 import os
 import re
@@ -82,6 +83,11 @@ VALID_MSG_TYPES = {
     "plan_approval_response",
 }
 
+# -- Request trackers: correlate by request_id --
+shutdown_requests = {}
+plan_requests = {}
+_tracker_lock = threading.Lock()
+
 # -- MessageBus: JSONL inbox per teammate --
 # 消息总线：为每个“队友”提供一个基于JSONL文件的收件箱
 class MessageBus:
@@ -108,21 +114,6 @@ class MessageBus:
         BUS.send("lead", "alice", "所有人停止工作", msg_type="shutdown_request")
         """
 
-        """
-        extra: dict 是一个“扩展槽”。
-        标准的消息体只需要 from, content, timestamp。
-        但有时候可能需要传递一些非标准的额外数据（比如任务的优先级、关联的文件名等）。
-        把它设为可选，是为了保持函数的灵活性。如果没有额外数据，就不传，保持消息体干净。
-
-        情况 A：不需要额外数据
-          BUS.send("alice", "bob", "代码写完了")
-          生成的 JSON: {"type": "message", "from": "alice", "content": "...", "timestamp": ...}
-
-        情况 B：需要带额外数据
-          BUS.send("alice", "bob", "任务完成", extra={"priority": "high", "file": "main.py"})
-          生成的 JSON: {"type": "message", ..., "priority": "high", "file": "main.py"}
-        """
-
         # 校验消息类型是否合法
         if msg_type not in VALID_MSG_TYPES:
             return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
@@ -132,7 +123,7 @@ class MessageBus:
             "type": msg_type,         # 消息类型（message / broadcast 等）
             "from": sender,           # 发送者
             "content": content,       # 消息内容
-            "timestamp": time.time(),# 时间戳
+            "timestamp": time.time(), # 时间戳
         }
 
         # 如果有额外字段，合并进去
@@ -194,13 +185,10 @@ class TeammateManager:
         # 团队目录
         self.dir = team_dir
         self.dir.mkdir(exist_ok=True)
-
         # 配置文件路径
         self.config_path = self.dir / "config.json"
-
         # 加载配置（成员信息等）
         self.config = self._load_config()
-
         # 存储运行中的线程：name -> thread
         self.threads = {}
 
@@ -208,7 +196,6 @@ class TeammateManager:
         # 如果配置文件存在，读取并解析
         if self.config_path.exists():
             return json.loads(self.config_path.read_text())
-
         # 否则返回默认配置
         return {"team_name": "default", "members": []}
 
@@ -227,12 +214,10 @@ class TeammateManager:
     def spawn(self, name: str, role: str, prompt: str) -> str:
         # 查找是否已有该成员
         member = self._find_member(name)
-
         if member:
             # 如果成员正在运行，不允许重复启动
             if member["status"] not in ("idle", "shutdown"):
                 return f"Error: '{name}' is currently {member['status']}"
-
             # 更新状态和角色
             member["status"] = "working"
             member["role"] = role
@@ -240,23 +225,18 @@ class TeammateManager:
             # 创建新成员
             member = {"name": name, "role": role, "status": "working"}
             self.config["members"].append(member)
-
         # 保存配置
         self._save_config()
-
         # 创建线程运行该智能体
         thread = threading.Thread(
             target=self._teammate_loop,
             args=(name, role, prompt),
             daemon=True,
         )
-
         # 保存线程引用
         self.threads[name] = thread
-
         # 启动线程
         thread.start()
-
         return f"Spawned '{name}' (role: {role})"
 
     # 子智能体的loop
@@ -279,12 +259,15 @@ class TeammateManager:
         sys_prompt = (
             f"You are '{name}', role: {role}, at {WORKDIR}. "
             f"Use send_message to communicate. Complete your task."
+            f"Submit plans via plan_approval before major work. "
+            f"Respond to shutdown_request with shutdown_response."
         )
         # 初始对话消息
         messages = [{"role": "user", "content": prompt}]
         # 可用工具列表
         tools = self._teammate_tools()
-
+        # 默认不退出，继续干活
+        should_exit = False
         # 最多执行50轮（防止无限循环）
         for _ in range(50):
             # 读取收件箱消息
@@ -292,6 +275,9 @@ class TeammateManager:
             # 将消息加入上下文
             for msg in inbox:
                 messages.append({"role": "user", "content": json.dumps(msg)})
+            # 检查旗帜，真正的退出
+            if should_exit:
+                break
             try:
                 # 调用模型生成回复
                 response = client.messages.create(
@@ -319,13 +305,26 @@ class TeammateManager:
                         "tool_use_id": block.id,
                         "content": str(output),
                     })
+                    # shutdown的核心逻辑：
+                    # 当领导发来 shutdown_request，teammate 思考后调用了 shutdown_response 工具，并且参数 approve=true 后，
+                    # 改变 should_exit 旗杆状态
+                    if block.name == "shutdown_response" and block.input.get("approve"):
+                        should_exit = True
             # 将工具结果作为用户消息喂回模型（继续对话）
             messages.append({"role": "user", "content": results})
 
         # 任务结束后更新成员状态
         member = self._find_member(name)
-        if member and member["status"] != "shutdown":
-            member["status"] = "idle"
+        # s09:
+        # if member:
+        #     if member["status"] != "shutdown":
+        #         member["status"] = "idle"
+        #         self._save_config()
+        # s10: 
+        # 如果是因为 should_exit = True 退出的，状态就记为 "shutdown"
+        # 如果是别的原因（比如转了50轮没事干了，或者报错了）退出的，状态记为 "idle"
+        if member:
+            member["status"] = "shutdown" if should_exit else "idle"
             self._save_config()
 
     # 子智能体的Handler
@@ -355,6 +354,58 @@ class TeammateManager:
         if tool_name == "read_inbox":
             return json.dumps(BUS.read_inbox(sender), indent=2)
 
+        # ==========================================
+        # 协议 1 处理：关机响应
+        # 决策权在 Teammate 手中，由 Teammate 触发并修改状态
+        # ==========================================
+        if tool_name == "shutdown_response":
+            # 从 LLM 传来的参数中提取 "挂号条" ID，用于在 Tracker 中定位这笔请求
+            req_id = args["request_id"]
+            # 提取 Teammate LLM 的最终决定：True 表示同意关机，False 表示拒绝关机
+            approve = args["approve"]
+            
+            # 【加锁】因为多个 Teammate 线程可能同时修改全局字典，必须用锁保证数据安全
+            with _tracker_lock:
+                # 防御性编程：检查这个 req_id 是不是 Lead 真的发出来的，防止 LLM 幻觉乱造 ID
+                if req_id in shutdown_requests:
+                    # 【核心：驱动 FSM】根据 approve 布尔值，将状态从 pending 流转为 approved 或 rejected
+                    shutdown_requests[req_id]["status"] = "approved" if approve else "rejected"
+            
+            # 状态在本地落盘后，通过消息总线把结果回传给 Lead
+            BUS.send(
+                sender, "lead", 
+                args.get("reason", ""), # 如果 Teammate 拒绝，这里会带上拒绝理由；没理由默认空字符串
+                "shutdown_response",    # 消息类型标识
+                {"request_id": req_id, "approve": approve}, # 结构化载荷：必须带上 req_id 给 Lead 对账
+            )
+            # 返回执行结果给当前 Teammate 的 LLM，让它知道自己的工具调用成功了，return后在teammate loop中触发 should_exit 逻辑
+            return f"Shutdown {'approved' if approve else 'rejected'}"
+        
+        # ==========================================
+        # 协议 2 处理：计划提交
+        # 决策权在 Lead 手中，Teammate 只负责发起请求并创建 pending 状态
+        # ==========================================
+        if tool_name == "plan_approval":
+            # 提取 Teammate 想要执行的计划文本内容
+            plan_text = args.get("plan", "")
+            # 【生成挂号条】由发起方生成唯一的 8 位 request_id
+            req_id = str(uuid.uuid4())[:8]
+            
+            # 【加锁】保护共享字典的写入操作
+            with _tracker_lock:
+                # 在 Tracker 中为这个新计划开一个房间，初始状态强制设为 pending
+                plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending"}
+            
+            # 通过消息总线把计划内容和 req_id 打包发送给 Lead 进行审查
+            BUS.send(
+                sender, "lead", 
+                plan_text,                   # 计划正文作为消息内容发给 Lead 看
+                "plan_approval_response",    # 消息类型标识（注：这个名字在 Lead 那边会触发对应的审查逻辑）
+                {"request_id": req_id, "plan": plan_text}, # 结构化载荷
+            )
+            # 返回结果给 Teammate 的 LLM，告诉它计划已提交，必须停下来等待 Lead 的批复
+            return f"Plan submitted (request_id={req_id}). Waiting for lead approval."
+
         # 未知工具
         return f"Unknown tool: {tool_name}"
 
@@ -379,6 +430,13 @@ class TeammateManager:
 
             {"name": "read_inbox", "description": "Read and drain your inbox.",
              "input_schema": {"type": "object", "properties": {}}},
+
+            {"name": "shutdown_response", "description": "Respond to a shutdown request. Approve to shut down, reject to keep working.",
+             "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["request_id", "approve"]}},
+
+            {"name": "plan_approval", "description": "Submit a plan for lead approval. Provide plan text.",
+             "input_schema": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]}},
+
         ]
 
     # 列出所有成员状态
@@ -1121,6 +1179,37 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+# -- Lead-specific protocol handlers --
+def handle_shutdown_request(teammate: str) -> str:
+    req_id = str(uuid.uuid4())[:8]
+    with _tracker_lock:
+        shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
+    BUS.send(
+        "lead", teammate, "Please shut down gracefully.",
+        "shutdown_request", {"request_id": req_id},
+    )
+    return f"Shutdown request {req_id} sent to '{teammate}' (status: pending)"
+
+
+def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
+    with _tracker_lock:
+        req = plan_requests.get(request_id)
+    if not req:
+        return f"Error: Unknown plan request_id '{request_id}'"
+    with _tracker_lock:
+        req["status"] = "approved" if approve else "rejected"
+    BUS.send(
+        "lead", req["from"], feedback, "plan_approval_response",
+        {"request_id": request_id, "approve": approve, "feedback": feedback},
+    )
+    return f"Plan {req['status']} for '{req['from']}'"
+
+
+def _check_shutdown_status(request_id: str) -> str:
+    with _tracker_lock:
+        return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
+
+
 # %% ----------- TOOOLS, ToolMap and System prompt -----------
 
 # 工具列表(定义工具的名称、描述和输入格式)。模型会根据这个列表来决定调用哪个工具, 以及如何构造输入参数。
@@ -1168,6 +1257,12 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "broadcast", "description": "Send a message to all teammates.",
      "input_schema": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
+    {"name": "shutdown_request", "description": "Request a teammate to shut down gracefully. Returns a request_id for tracking.",
+     "input_schema": {"type": "object", "properties": {"teammate": {"type": "string"}}, "required": ["teammate"]}},
+    {"name": "shutdown_response", "description": "Check the status of a shutdown request by request_id.",
+     "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}}, "required": ["request_id"]}},
+    {"name": "plan_approval", "description": "Approve or reject a teammate's plan. Provide request_id + approve + optional feedback.",
+     "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, "required": ["request_id", "approve"]}},
 ]
 
 
@@ -1186,17 +1281,22 @@ TOOL_HANDLERS = {
     "task_get":    lambda **kw: TASKS.get(kw["task_id"]),
     "background_run":   lambda **kw: BG.run(kw["command"]),
     "check_background": lambda **kw: BG.check(kw.get("task_id")),
-        "spawn_teammate":  lambda **kw: TEAM.spawn(kw["name"], kw["role"], kw["prompt"]),
+    "spawn_teammate":  lambda **kw: TEAM.spawn(kw["name"], kw["role"], kw["prompt"]),
     "list_teammates":  lambda **kw: TEAM.list_all(),
     "send_message":    lambda **kw: BUS.send("lead", kw["to"], kw["content"], kw.get("msg_type", "message")),
     "read_inbox":      lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2),
     "broadcast":       lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
+    "shutdown_request":  lambda **kw: handle_shutdown_request(kw["teammate"]),
+    "shutdown_response": lambda **kw: _check_shutdown_status(kw.get("request_id", "")),
+    "plan_approval":     lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
 }
 
 # 系统提示词
 SYSTEM = f"""
-You are a coding agent and a team lead at {WORKDIR} on a Windows Operating System. Spawn teammates and communicate via inboxes.
-Planning: Use the todo tool to plan multi-step tasks (mark as in_progress when starting, completed when done). 
+You are a coding agent and a team lead at {WORKDIR} on a Windows Operating System. Spawn teammates and communicate via inboxes. Manage teammates with shutdown and plan approval protocols.
+Planning: 
+          Use the todo tool to plan multi-step tasks (mark as in_progress when starting, completed when done). 
+          Important: Don't use todo tool easily. Todo is only used for complex tasks that may have five or more steps.
           Use the task tool to delegate exploration or subtasks. 
           Use background_run for long-running commands.
 Knowledge: Use load_skill to access specialized knowledge for unfamiliar topics. Available skills: {SKILL_LOADER.get_descriptions()}.
@@ -1330,160 +1430,8 @@ if __name__ == "__main__":
                     print()
                     print("----------------------this is the response----------------------")
                     print(block.text)
-        print()  # 空行分隔
-
-
-# TODO 真正的思路（已得到验证。后续需要看看最新的learn claude code如何处理）：
+        print()
 """
-    我给lead发消息：
-    Spawn Alice (coder) and Bob (tester). 
-    Have Alice send Bob a message "hello, you must send a message 'copy that' to the lead, and you must not do anything else".
-    其实暗含了一个逻辑：
-        spawn alice，让alice给bob发消息，spawn bob。
-    但lead理解错了，逻辑变成了spawn alice，spawn bob，让alice给bob发消息。
-    那样就会出现：
-        首先spawn了两个teammate，并且都进入work，运行了teammate loop，没有执行任何除了teammate sys_prompt的内容，然后结束变成idle。
-        之后lead给alice发消息，让他给bob发消息。但是alice已经进入了idle。
-    因此，alice仅仅接收消息，而没给bob发消息。
-
-    这样的理解错误时而会出现，时而不会出现（例如，lead有时确实会先spawn了alice，并执行了“给bob发消息”这一动作）。
-    
-    解决办法：
-        给lead的系统提示词中加入逻辑：
-            如果一开始就spawn，子智能体仅仅创建时时work，没有任何操作就进入了idle。因此，你需要注意spawn和任务完成的时机问题。
-    另一个解决办法：
-        让lead常常访问所有人的邮箱，一旦发现某个teammate接收到了消息，lead需要重新spawn它。
-    
-    要验证我提出的问题，可以对比两个提示词下的效果：
-    prompt1（真正能达到目的）：Spawn Alice (coder). Have Alice send Bob a message "hello, you must send a message 'copy that' to the lead, and you must not do anything else". Then spawn Bob (tester).
-    prompt2（往往很难达到目的）：Spawn Alice (coder) and Bob (tester). Have Alice send Bob a message "hello, you must send a message 'copy that' to the lead, and you must not do anything else".
-
-    如果在真正的使用环境下，使用prompt1会很笨重。
-"""
-# TODO 日志如下：
-"""
-s01 >> Spawn Alice (coder) and Bob (tester). Have Alice send Bob a message "hello, you must send a message 'copy that' to the lead, and you must not do anything else".
-
-> todo:
-[>] #1: Spawn Alice (coder) and Bob (tester)
-[ ] #2: Have Alice send Bob the specified message
-(0/2 completed)
-
-> spawn_teammate:
-Spawned 'Alice' (role: coder)
-
-> spawn_teammate:
-Spawned 'Bob' (role: tester)
-
-> todo:
-[x] #1: Spawn Alice (coder) and Bob (tester)     
-[>] #2: Have Alice send Bob the specified message
-(1/2 completed)
-
-> send_message:
-Sent message to Alice
-  [Bob] read_inbox: []
-
-> read_inbox:
-[]
-
-> list_teammates:
-Team: default
-  Alice (coder): idle
-  Bob (tester): working
-
-> todo:
-[x] #1: Spawn Alice (coder) and Bob (tester)
-[x] #2: Have Alice send Bob the specified message
-(2/2 completed)
-
-----------------------this is the response----------------------
-I've completed both tasks:
-1. ✅ Spawned Alice (coder) and Bob (tester) as teammates
-2. ✅ Sent Alice the instruction to send Bob the exact message: "hello, you must send a message 'copy that' to the lead, and you must not do anything else"
-
-Alice is currently idle and Bob is working. Alice should have received my message and should be sending the specified message to Bob. Once Bob receives the message, he should follow the instructions and send "copy that" to the lead (me).
-
-s01 >> But lead didn't receive a message from Bob in his mailbox. But lead did send Alice a message. Please wake Alice up and let her receive the message.
-
-> read_inbox:
-[]
-
-> broadcast:
-Broadcast to 2 teammates
-
-> read_inbox:
-[]
-
-> todo:
-[x] #1: Spawn Alice (coder) and Bob (tester)
-[x] #2: Have Alice send Bob the specified message
-[x] #3: Wake up Alice to process message
-(3/3 completed)
-
-> list_teammates:
-Team: default
-  Alice (coder): idle
-  Bob (tester): idle
-
-> read_inbox:
-[]
-
-> send_message:
-Sent message to Alice
-
-[x] #1: Spawn Alice (coder) and Bob (tester)
-[x] #2: Have Alice send Bob the specified message
-[x] #3: Wake up Alice to process message
-[x] #4: Send direct action message to Alice
-(4/4 completed)
-
-----------------------this is the response----------------------
-All tasks completed. I've:
-
-1. ✅ Spawned both teammates
-2. ✅ Sent the initial instruction to Alice
-3. ✅ Broadcast to wake up teammates
-4. ✅ Sent a direct action message to Alice with clear instructions
-
-Now Alice should process the message and send it to Bob, and Bob should then send "copy that" to me. The message chain should be flowing through the system.
-
-s01 >>
-"""
-# TODO 各个文件的内容：
-"""
-Alice.jsonl:
-    {"type": "message", "from": "lead", "content": "Please send Bob a message with exactly this content: \"hello, you must send a message 'copy that' to the lead, and you must not do anything else\"", "timestamp": 1776424079.0408175}
-    {"type": "broadcast", "from": "lead", "content": "Wake up and check your inbox for messages!", "timestamp": 1776424320.5763037}
-    {"type": "message", "from": "lead", "content": "ACTION REQUIRED: Please immediately send Bob this exact message: \"hello, you must send a message 'copy that' to the lead, and you must not do anything else\"", "timestamp": 1776424344.1104789}
-
-Bob.jsonl:
-    {"type": "broadcast", "from": "lead", "content": "Wake up and check your inbox for messages!", "timestamp": 1776424320.5763037}
-
-config.json:
-    {
-    "team_name": "default",
-    "members": [
-        {
-        "name": "Alice",
-        "role": "coder",
-        "status": "idle"
-        },
-        {
-        "name": "Bob",
-        "role": "tester",
-        "status": "idle"
-        }
-    ]
-    }
-"""
-"""
-我又使用了learn claude code的s09进行测试，发现完全没问题。发现了根本原因：
-由于TODO的存在，模型在使用TODO时强制打破了原有逻辑，硬要分条列写，即TODO污染了LLM的原始逻辑。
-
-也因此，多了一种修改方案：
-    修改lead的系统提示词：五步以内可以完成的事情，不要用TODO。
-
 产生好奇，s_full肯定集成了TODO和agent_teams，s_full怎么样？
 试了试发现没问题。
 那么s_full如何处理的？
