@@ -72,6 +72,8 @@ INBOX_DIR = TEAM_DIR / "inbox"
 
 THRESHOLD = 50000
 KEEP_RECENT = 3
+POLL_INTERVAL = 5
+IDLE_TIMEOUT = 60
 
 # %% ------------ MessageBus and TeammateManager ------------
 
@@ -86,7 +88,8 @@ VALID_MSG_TYPES = {
 # -- Request trackers: correlate by request_id --
 shutdown_requests = {}
 plan_requests = {}
-_tracker_lock = threading.Lock()
+_tracker_lock = threading.Lock() # 请求追踪锁,保护 shutdown_requests、plan_requests
+_claim_lock = threading.Lock() # 任务认领锁,保护任务文件系统 (.tasks/task_*.json) 以及 claim_task 函数中的逻辑
 
 # -- MessageBus: JSONL inbox per teammate --
 # 消息总线：为每个“队友”提供一个基于JSONL文件的收件箱
@@ -100,24 +103,9 @@ class MessageBus:
     # TODO: leader和sub都可以调用的工具，用于所有智能体间通信
     def send(self, sender: str, to: str, content: str,
              msg_type: str = "message", extra: dict = None) -> str:
-        """
-        msg_type: str = "message"
-        在智能体通信中，绝大多数情况（90%）都是普通的“聊天消息”。
-        如果每次发消息都要写 msg_type="message" 会很啰嗦。
-        当需要发送特殊指令（比如 broadcast，或者 shutdown_request）时，才需要指定。
-
-        # 情况 A：不传 msg_type，默认就是 "message"
-          BUS.send("alice", "bob", "你好")
-          BUS.send("alice", "bob", "你好", msg_type="message")
-
-        # 情况 B：显式指定 msg_type
-        BUS.send("lead", "alice", "所有人停止工作", msg_type="shutdown_request")
-        """
-
         # 校验消息类型是否合法
         if msg_type not in VALID_MSG_TYPES:
             return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
-
         # 构造消息体
         msg = {
             "type": msg_type,         # 消息类型（message / broadcast 等）
@@ -125,57 +113,88 @@ class MessageBus:
             "content": content,       # 消息内容
             "timestamp": time.time(), # 时间戳
         }
-
         # 如果有额外字段，合并进去
         if extra:
             msg.update(extra)
-
         # 收件箱路径（每个用户一个文件）
         inbox_path = self.dir / f"{to}.jsonl"
-
         # 以追加方式写入一行JSON（JSONL格式）
         with open(inbox_path, "a") as f:
             f.write(json.dumps(msg) + "\n")
-
         return f"Sent {msg_type} to {to}"
     
+
     # TODO: leader和sub都可以调用的工具
     # 读取磁盘上属于该智能体的专属文件，读取之后，它会立即清空文件内容
     def read_inbox(self, name: str) -> list:        
         # 获取指定用户的收件箱文件路径
         inbox_path = self.dir / f"{name}.jsonl"
-
         # 如果文件不存在，说明没有消息
         if not inbox_path.exists():
             return []
-
         messages = []
-
         # 逐行读取JSONL文件
         for line in inbox_path.read_text().strip().splitlines():
             if line:
                 messages.append(json.loads(line))  # 反序列化为字典
-
         # 读取后清空收件箱（“消费”模式）
         inbox_path.write_text("")
-
         return messages
+
 
     # 供leader使用，向所有队友广播（除了自己）
     def broadcast(self, sender: str, content: str, teammates: list) -> str:
         count = 0
-
         for name in teammates:
             if name != sender:
                 # 调用send发送广播消息
                 self.send(sender, name, content, "broadcast")
                 count += 1
-
         return f"Broadcast to {count} teammates"
 
 
 # 全局消息总线实例
 BUS = MessageBus(INBOX_DIR)
+
+# -- Task board scanning --
+def scan_unclaimed_tasks() -> list:
+    TASKS_DIR.mkdir(exist_ok=True)
+    unclaimed = []
+    for f in sorted(TASKS_DIR.glob("task_*.json")):
+        task = json.loads(f.read_text())
+        if (task.get("status") == "pending"
+                and not task.get("owner")
+                and not task.get("blockedBy")):
+            unclaimed.append(task)
+    return unclaimed
+
+
+def claim_task(task_id: int, owner: str) -> str:
+    with _claim_lock:
+        path = TASKS_DIR / f"task_{task_id}.json"
+        if not path.exists():
+            return f"Error: Task {task_id} not found"
+        task = json.loads(path.read_text())
+        if task.get("owner"):
+            existing_owner = task.get("owner") or "someone else"
+            return f"Error: Task {task_id} has already been claimed by {existing_owner}"
+        if task.get("status") != "pending":
+            status = task.get("status")
+            return f"Error: Task {task_id} cannot be claimed because its status is '{status}'"
+        if task.get("blockedBy"):
+            return f"Error: Task {task_id} is blocked by other task(s) and cannot be claimed yet"
+        task["owner"] = owner
+        task["status"] = "in_progress"
+        path.write_text(json.dumps(task, indent=2))
+    return f"Claimed task #{task_id} for {owner}"
+
+
+# -- Identity re-injection after compression --
+def make_identity_block(name: str, role: str, team_name: str) -> dict:
+    return {
+        "role": "user",
+        "content": f"<identity>You are '{name}', role: {role}, team: {team_name}. Continue your work.</identity>",
+    }
 
 
 # -- TeammateManager: persistent named agents with config.json --
@@ -210,6 +229,22 @@ class TeammateManager:
                 return m
         return None
 
+    def _set_status(self, name: str, status: str):
+        # s09:
+        # if member:
+        #     if member["status"] != "shutdown":
+        #         member["status"] = "idle"
+        #         self._save_config()
+        # s10: 
+        # 如果是因为 should_exit = True 退出的，状态就记为 "shutdown"
+        # 如果是别的原因（比如转了50轮没事干了，或者报错了）退出的，状态记为 "idle"
+        # s11:
+        # 把s10的内容封装成set_status，为了使得idle和shutdown复用
+        member = self._find_member(name)
+        if member:
+            member["status"] = status
+            self._save_config()
+
     # 新建或征用一个子智能体，修改名单中的状态并运行它的loop
     def spawn(self, name: str, role: str, prompt: str) -> str:
         # 查找是否已有该成员
@@ -233,34 +268,22 @@ class TeammateManager:
             args=(name, role, prompt),
             daemon=True,
         )
-        # 保存线程引用
+        # 保存线程引用,并启动线程
         self.threads[name] = thread
-        # 启动线程
         thread.start()
         return f"Spawned '{name}' (role: {role})"
 
     # 子智能体的loop
     def _teammate_loop(self, name: str, role: str, prompt: str):
-        """
-        在 s04 的架构中，子智能体就像一个研究员。
-            任务：父智能体派它去查资料。
-            过程：它查了很多文件，思考了很多。
-            输出：最后，它把所有发现总结成一段文字，返回给父智能体。
-            代码体现：run_subagent() 函数会 return 一个字符串摘要。
-
-        在 s09 的架构中，子智能体更像一个建筑工人。
-            任务：Lead 派它去“写一个登录页面”。
-            过程：它调用 write_file 工具，创建了 login.html。
-            输出：它的“输出”就是那个新创建的 login.html 文件！
-            代码体现：当它完成任务，不再调用工具时，循环 break，线程结束。没有 return 任何文字。
-        """
-
+        # TODO: 没做强制关机。这里的关机都是teammate决定的。
+        team_name = self.config["team_name"]
         # 系统提示词（定义智能体身份）
         sys_prompt = (
-            f"You are '{name}', role: {role}, at {WORKDIR}. "
+            f"You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}. "
             f"Use send_message to communicate. Complete your task."
             f"Submit plans via plan_approval before major work. "
             f"Respond to shutdown_request with shutdown_response."
+            f"Use idle tool when you have no more work. You will auto-claim new tasks."
         )
         # 初始对话消息
         messages = [{"role": "user", "content": prompt}]
@@ -268,64 +291,115 @@ class TeammateManager:
         tools = self._teammate_tools()
         # 默认不退出，继续干活
         should_exit = False
-        # 最多执行50轮（防止无限循环）
-        for _ in range(50):
-            # 读取收件箱消息
-            inbox = BUS.read_inbox(name)
-            # 将消息加入上下文
-            for msg in inbox:
-                messages.append({"role": "user", "content": json.dumps(msg)})
-            # 检查旗帜，真正的退出
-            if should_exit:
-                break
-            try:
-                # 调用模型生成回复
-                response = client.messages.create(
-                    model=MODEL,system=sys_prompt,messages=messages,
-                    tools=tools,max_tokens=8000,)
-            except Exception:
-                # 出错直接退出循环
-                break
-            # 将模型输出加入对话
-            messages.append({"role": "assistant", "content": response.content})
-            # 如果不是工具调用，则任务结束
-            if response.stop_reason != "tool_use":
-                break
-            results = []
-            # 处理模型发起的工具调用
-            for block in response.content:
-                if block.type == "tool_use":
-                    # 执行工具
-                    output = self._exec(name, block.name, block.input)
-                    # 打印日志（调试用）
-                    print(f"  [{name}] {block.name}: {str(output)[:120]}")
-                    # 构造工具返回结果
-                    results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": str(output),
-                    })
-                    # shutdown的核心逻辑：
-                    # 当领导发来 shutdown_request，teammate 思考后调用了 shutdown_response 工具，并且参数 approve=true 后，
-                    # 改变 should_exit 旗杆状态
-                    if block.name == "shutdown_response" and block.input.get("approve"):
-                        should_exit = True
-            # 将工具结果作为用户消息喂回模型（继续对话）
-            messages.append({"role": "user", "content": results})
+        while True:
+            # 最多执行50轮（防止无限循环）
+            for _ in range(50):
+                # 读取收件箱消息
+                inbox = BUS.read_inbox(name)
+                # 将消息加入上下文
+                for msg in inbox:
+                    messages.append({"role": "user", "content": json.dumps(msg)})
+                # 检查旗帜，真正的退出
+                if should_exit:
+                    self._set_status(name, "shutdown")
+                    return
+                try:
+                    # 调用模型生成回复
+                    response = client.messages.create(
+                        model=MODEL,system=sys_prompt,messages=messages,
+                        tools=tools,max_tokens=8000,)
+                except Exception:
+                    # 出错直接退出循环
+                    break
+                # 将模型输出加入对话
+                messages.append({"role": "assistant", "content": response.content})
+                # 如果不是工具调用，则任务结束
+                if response.stop_reason != "tool_use":
+                    break
+                results = []
+                idle_requested = False
+                # 处理模型发起的工具调用
+                for block in response.content:
+                    if block.type == "tool_use":
+                        if block.name == "idle":
+                            idle_requested = True
+                            output = "Entering idle phase. Will poll for new tasks."
+                        else:
+                        # 执行工具
+                            output = self._exec(name, block.name, block.input)
+                        # 打印日志
+                        print(f"  [{name}] {block.name}: {str(output)[:120]}")
+                        # 构造工具返回结果
+                        results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": str(output),
+                        })
+                        # shutdown的核心逻辑：
+                        # 当领导发来 shutdown_request，teammate 思考后调用了 shutdown_response 工具，并且参数 approve=true 后，
+                        # 改变 should_exit 旗杆状态
+                        if block.name == "shutdown_response" and block.input.get("approve"):
+                            should_exit = True
+                # 将工具结果作为用户消息喂回模型（继续对话）
+                messages.append({"role": "user", "content": results})
+                if idle_requested:
+                    break
+            
+            # -- IDLE PHASE: poll for inbox messages and unclaimed tasks --
+            self._set_status(name, "idle") # 50轮结束自动进入idle
+            resume = False # 初始化恢复标志：默认假设无任务不工作
+            polls = IDLE_TIMEOUT // max(POLL_INTERVAL, 1) # 计算最大轮询次数
+            for _ in range(polls): # 进入轮询循环
+                time.sleep(POLL_INTERVAL)
+                inbox = BUS.read_inbox(name) # --- 检查点 A：有没有消息
+                if inbox: # 如果有消息，遍历处理
+                    for msg in inbox:
+                        # 特殊情况：如果是关机指令，强制退出
+                        if msg.get("type") == "shutdown_request":
+                            self._set_status(name, "shutdown")
+                            return
+                        # 普通消息：将 JSON 格式的消息转为字符串，加入上下文
+                        messages.append({"role": "user", "content": json.dumps(msg)})
+                    # 有消息处理，设置标志位并跳出轮询，回到 WORK 阶段
+                    resume = True
+                    break
+                # --- 检查点 B：有没有未认领的任务（sort过取第一个可用任务）
+                unclaimed = scan_unclaimed_tasks()
+                if unclaimed:
+                    task = unclaimed[0]
+                    result = claim_task(task["id"], name) # 尝试认领任务（内部带锁）
+                    if result.startswith("Error:"): # 如果认领失败进入下一次轮询循环，继续找任务
+                        continue
+                    # 认领成功，构造任务提示语，告诉 LLM 它刚刚自动认领了什么
+                    task_prompt = (
+                        f"<auto-claimed>Task #{task['id']}: {task['subject']}\n"
+                        f"{task.get('description', '')}</auto-claimed>"
+                    )
+                    # --- 关键：身份重注入 ---
+                    # 如果上下文太短（len <= 3），说明可能发生了严重的上下文压缩或重置
+                    # 此时 LLM 可能忘了自己是谁。因此必须重新插入身份块。
+                    if len(messages) <= 3:
+                        # 在最前面插入 teammate 的身份定义
+                        messages.insert(0, make_identity_block(name, role, team_name))
+                        # 紧接着插入一个助手的回复，模拟 LLM 说“我回来了”，让对话衔接更自然
+                        messages.insert(1, {"role": "assistant", "content": f"I am {name}. Continuing."})
+                    # 将任务信息加入上下文
+                    messages.append({"role": "user", "content": task_prompt})
+                    # 模拟 LLM 已经接受了任务（预设一个 assistant 回复），引导 LLM 接着干活
+                    messages.append({"role": "assistant", "content": f"Claimed task #{task['id']}. Working on it."})
+                    # 找到活了，设置标志位并跳出轮询，回到 WORK 阶段
+                    resume = True
+                    break
+            # --- 超时处理 ---
+            # 如果 for 循环跑完了（12次都检查了），resume 还是 False，说明既没消息也没任务，等了60秒
+            if not resume:
+                self._set_status(name, "shutdown")
+                return
+            # --- 恢复工作 ---
+            # 如果 resume 是 True（说明上面 break 出来了），更新状态为 working
+            # while True 的下一次循环会回到 WORK 阶段继续处理新的 messages
+            self._set_status(name, "working")
 
-        # 任务结束后更新成员状态
-        member = self._find_member(name)
-        # s09:
-        # if member:
-        #     if member["status"] != "shutdown":
-        #         member["status"] = "idle"
-        #         self._save_config()
-        # s10: 
-        # 如果是因为 should_exit = True 退出的，状态就记为 "shutdown"
-        # 如果是别的原因（比如转了50轮没事干了，或者报错了）退出的，状态记为 "idle"
-        if member:
-            member["status"] = "shutdown" if should_exit else "idle"
-            self._save_config()
 
     # 子智能体的Handler
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
@@ -333,16 +407,12 @@ class TeammateManager:
 
         if tool_name == "bash":
             return _run_bash(args["command"])
-
         if tool_name == "read_file":
             return _run_read(args["path"])
-
         if tool_name == "write_file":
             return _run_write(args["path"], args["content"])
-
         if tool_name == "edit_file":
             return _run_edit(args["path"], args["old_text"], args["new_text"])
-
         if tool_name == "send_message":
             return BUS.send(
                 sender,
@@ -350,15 +420,13 @@ class TeammateManager:
                 args["content"],
                 args.get("msg_type", "message")
             )
-
         if tool_name == "read_inbox":
             return json.dumps(BUS.read_inbox(sender), indent=2)
-
+        if tool_name == "shutdown_response":
         # ==========================================
         # 协议 1 处理：关机响应
         # 决策权在 Teammate 手中，由 Teammate 触发并修改状态
         # ==========================================
-        if tool_name == "shutdown_response":
             # 从 LLM 传来的参数中提取 "挂号条" ID，用于在 Tracker 中定位这笔请求
             req_id = args["request_id"]
             # 提取 Teammate LLM 的最终决定：True 表示同意关机，False 表示拒绝关机
@@ -380,12 +448,11 @@ class TeammateManager:
             )
             # 返回执行结果给当前 Teammate 的 LLM，让它知道自己的工具调用成功了，return后在teammate loop中触发 should_exit 逻辑
             return f"Shutdown {'approved' if approve else 'rejected'}"
-        
+        if tool_name == "plan_approval":
         # ==========================================
         # 协议 2 处理：计划提交
         # 决策权在 Lead 手中，Teammate 只负责发起请求并创建 pending 状态
         # ==========================================
-        if tool_name == "plan_approval":
             # 提取 Teammate 想要执行的计划文本内容
             plan_text = args.get("plan", "")
             # 【生成挂号条】由发起方生成唯一的 8 位 request_id
@@ -405,9 +472,11 @@ class TeammateManager:
             )
             # 返回结果给 Teammate 的 LLM，告诉它计划已提交，必须停下来等待 Lead 的批复
             return f"Plan submitted (request_id={req_id}). Waiting for lead approval."
-
+        if tool_name == "claim_task":
+            return claim_task(args["task_id"], sender)
         # 未知工具
         return f"Unknown tool: {tool_name}"
+
 
     # 子智能体的工具定义
     def _teammate_tools(self) -> list:
@@ -437,6 +506,8 @@ class TeammateManager:
             {"name": "plan_approval", "description": "Submit a plan for lead approval. Provide plan text.",
              "input_schema": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]}},
 
+            {"name": "claim_task", "description": "Claim a task from the task board by ID.",
+             "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
         ]
 
     # 列出所有成员状态
@@ -1263,6 +1334,11 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}}, "required": ["request_id"]}},
     {"name": "plan_approval", "description": "Approve or reject a teammate's plan. Provide request_id + approve + optional feedback.",
      "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, "required": ["request_id", "approve"]}},
+    {"name": "idle", "description": "Enter idle state (for lead -- rarely used).",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "claim_task", "description": "Claim a task from the board by ID.",
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
+
 ]
 
 
@@ -1289,17 +1365,23 @@ TOOL_HANDLERS = {
     "shutdown_request":  lambda **kw: handle_shutdown_request(kw["teammate"]),
     "shutdown_response": lambda **kw: _check_shutdown_status(kw.get("request_id", "")),
     "plan_approval":     lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
+    "idle":              lambda **kw: "Lead does not idle.",
+    "claim_task":        lambda **kw: claim_task(kw["task_id"], "lead"),
 }
 
 # 系统提示词
 SYSTEM = f"""
-You are a coding agent and a team lead at {WORKDIR} on a Windows Operating System. Spawn teammates and communicate via inboxes. Manage teammates with shutdown and plan approval protocols.
+You are a coding agent and a team lead at {WORKDIR} on a Windows Operating System. 
 Planning: 
           Use the todo tool to plan multi-step tasks (mark as in_progress when starting, completed when done). 
           Important: Don't use todo tool easily. Todo is only used for complex tasks that may have five or more steps.
           Use the task tool to delegate exploration or subtasks. 
           Use background_run for long-running commands.
 Knowledge: Use load_skill to access specialized knowledge for unfamiliar topics. Available skills: {SKILL_LOADER.get_descriptions()}.
+Multi-Agent:
+          Spawn teammates and communicate via inboxes. 
+          Manage teammates with shutdown and plan approval protocols. 
+          Teammates are autonomous -- they find work themselves.
 Behavior: Prefer using tools over generating prose.
 """
 # SUBAGENT_SYSTEM = f"""You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."""
@@ -1419,6 +1501,19 @@ if __name__ == "__main__":
         if query.strip() == "/inbox":
             print(json.dumps(BUS.read_inbox("lead"), indent=2))
             continue
+            # 检查用户输入的指令是否为 "/tasks" (这是一个查看任务看板的特殊指令，不需要发给 LLM 处理)
+        if query.strip() == "/tasks":
+            TASKS_DIR.mkdir(exist_ok=True)
+            for f in sorted(TASKS_DIR.glob("task_*.json")):
+                t = json.loads(f.read_text())
+                # 根据任务状态获取对应的视觉标记 ([ ] [>] [x])
+                marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(t["status"], "[?]")
+                # 如果任务有归属者，则将其格式化为 " @名字" (例如 @alice)，否则为空字符串
+                owner = f" @{t['owner']}" if t.get("owner") else ""
+                # 在控制台打印出格式化后的任务信息
+                # 示例输出: [ ] #5: Fix bug @alice
+                print(f"  {marker} #{t['id']}: {t['subject']}{owner}")
+                continue
         # TODO:---- agent_teams:Command-line Debugger >>>>
 
         history.append({"role": "user","content": query})
