@@ -1,50 +1,38 @@
 #!/usr/bin/env python3
-# Harness: protocols -- structured handshakes between models.
+# Harness: autonomy -- models that find work without being told.
 """
-s10_team_protocols.py - Team Protocols
+s11_autonomous_agents.py - Autonomous Agents
 
-Shutdown protocol and plan approval protocol, both using the same
-request_id correlation pattern. Builds on s09's team messaging.
+Idle cycle with task board polling, auto-claiming unclaimed tasks, and
+identity re-injection after context compression. Builds on s10's protocols.
 
-    Shutdown FSM: pending -> approved | rejected
+    Teammate lifecycle:
+    +-------+
+    | spawn |
+    +---+---+
+        |
+        v
+    +-------+  tool_use    +-------+
+    | WORK  | <----------- |  LLM  |
+    +---+---+              +-------+
+        |
+        | stop_reason != tool_use
+        v
+    +--------+
+    | IDLE   | poll every 5s for up to 60s
+    +---+----+
+        |
+        +---> check inbox -> message? -> resume WORK
+        |
+        +---> scan .tasks/ -> unclaimed? -> claim -> resume WORK
+        |
+        +---> timeout (60s) -> shutdown
 
-    Lead                              Teammate
-    +---------------------+          +---------------------+
-    | shutdown_request    |          |                     |
-    | {                   | -------> | receives request    |
-    |   request_id: abc   |          | decides: approve?   |
-    | }                   |          |                     |
-    +---------------------+          +---------------------+
-                                             |
-    +---------------------+          +-------v-------------+
-    | shutdown_response   | <------- | shutdown_response   |
-    | {                   |          | {                   |
-    |   request_id: abc   |          |   request_id: abc   |
-    |   approve: true     |          |   approve: true     |
-    | }                   |          | }                   |
-    +---------------------+          +---------------------+
-            |
-            v
-    status -> "shutdown", thread stops
+    Identity re-injection after compression:
+    messages = [identity_block, ...remaining...]
+    "You are 'coder', role: backend, team: my-team"
 
-    Plan approval FSM: pending -> approved | rejected
-
-    Teammate                          Lead
-    +---------------------+          +---------------------+
-    | plan_approval       |          |                     |
-    | submit: {plan:"..."}| -------> | reviews plan text   |
-    +---------------------+          | approve/reject?     |
-                                     +---------------------+
-                                             |
-    +---------------------+          +-------v-------------+
-    | plan_approval_resp  | <------- | plan_approval       |
-    | {approve: true}     |          | review: {req_id,    |
-    +---------------------+         |   approve: true}     |
-                                     +---------------------+
-
-    Trackers: {request_id: {"target|from": name, "status": "pending|..."}}
-
-Key insight: "Same request_id correlation pattern, two domains."
+Key insight: "The agent finds work itself."
 """
 
 import json
