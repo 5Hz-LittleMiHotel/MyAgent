@@ -311,6 +311,14 @@ def micro_compact(messages: list) -> list:
 
             # 替换为简短占位符（极大减少 token）
             result["content"] = f"[Previous: used {tool_name}]"
+            # Python 的 list / dict 存的是“对象引用”，不是值复制
+            # messages
+            # └── msg["role"] == "user"
+            #                 └── part=content (list)
+            #                     └── part (dict)
+            #                             └── result <-修改
+            # result是从to_clear取的值，to_clear是从tool_results取的值，
+            # tool_results是从msg.part取的值，msg才是messages中的一个message。
 
     return messages
 
@@ -327,7 +335,7 @@ def auto_compact(messages: list) -> list:
     # ---------------------------
     # 保存完整对话到本地文件（jsonl）
     # ---------------------------
-    TRANSCRIPT_DIR.mkdir(exist_ok=True)
+    TRANSCRIPT_DIR.mkdir(exist_ok=True) # TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 
     # 生成带时间戳的文件名
     transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
