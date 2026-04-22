@@ -234,7 +234,7 @@ def estimate_tokens(messages: list) -> int:
 
 
 def extract_critical(messages):
-    # 找最近一条报错、最近一条in_progress的todo
+    # 找最近一条报错
     errors = []
     for msg in messages:
         if msg["role"] == "user" and isinstance(msg.get("content"), list):
@@ -263,7 +263,7 @@ def micro_compact(messages: list) -> list:
         # tool_result 总是在 user role 且 content 是 list
         if msg["role"] == "user" and isinstance(msg.get("content"), list):
 
-            # 遍历 content 中的每一项（block）
+            # 遍历 content 中的每一项
             for part_idx, part in enumerate(msg["content"]):
 
                 # 找到 tool_result 类型
@@ -301,7 +301,7 @@ def micro_compact(messages: list) -> list:
 
     for _, _, result in to_clear:
 
-        # 只处理较长内容（避免无意义替换）
+        # 只处理较长内容（避免无意义替换, 如todo等）
         if isinstance(result.get("content"), str) and len(result["content"]) > 100:
 
             tool_id = result.get("tool_use_id", "")
