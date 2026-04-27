@@ -1,38 +1,51 @@
 #!/usr/bin/env python3
-# Harness: autonomy -- models that find work without being told.
+# Harness: directory isolation -- parallel execution lanes that never collide.
 """
-s11_autonomous_agents.py - Autonomous Agents
+s12_worktree_task_isolation.py - Worktree + Task Isolation
+                                   工作树 + 任务隔离
+Directory-level isolation for parallel task execution.
+并行任务执行的目录级隔离。
+Tasks are the control plane and worktrees are the execution plane.
+任务是控制平面，工作树是执行平面。
 
-Idle cycle with task board polling, auto-claiming unclaimed tasks, and
-identity re-injection after context compression. Builds on s10's protocols.
+    一个任务一个文件（One-file-per-task）：
+    .tasks/task_12.json
+      {
+        "id": 12,
+        "subject": "Implement auth refactor",
+        "status": "in_progress",
+        "worktree": "auth-refactor"
+      }
+      id, subject, status, owner: 业务状态（我们要做什么？做到哪了？谁负责？）。
+      worktree: "auth-refactor" （关键点！）：注意，这里存的是 name（名字），而不是 path（路径）。
+      这是一种极好的解耦。任务不需要知道 worktree 藏在 .worktrees/ 下面多深，也不需要知道 Git 分支叫什么。
+      它只记住：“我绑定了一个叫 auth-refactor 的执行环境。”
 
-    Teammate lifecycle:
-    +-------+
-    | spawn |
-    +---+---+
-        |
-        v
-    +-------+  tool_use    +-------+
-    | WORK  | <----------- |  LLM  |
-    +---+---+              +-------+
-        |
-        | stop_reason != tool_use
-        v
-    +--------+
-    | IDLE   | poll every 5s for up to 60s
-    +---+----+
-        |
-        +---> check inbox -> message? -> resume WORK
-        |
-        +---> scan .tasks/ -> unclaimed? -> claim -> resume WORK
-        |
-        +---> timeout (60s) -> shutdown
+    单一索引文件：
+    .worktrees/index.json
+      {
+        "worktrees": [
+          {
+            "name": "auth-refactor",
+            "path": ".../.worktrees/auth-refactor",
+            "branch": "wt/auth-refactor",
+            "task_id": 12,
+            "status": "active"
+          }
+        ]
+      }
+      name, path, branch: 这是纯粹的物理实现细节（在哪？基于什么分支拉出来的？）。
+      task_id: 12 （关键点！）：这是反向指针，指回控制面。
 
-    Identity re-injection after compression:
-    messages = [identity_block, ...remaining...]
-    "You are 'coder', role: backend, team: my-team"
+两个文件双向绑定。
+崩溃后从 .tasks/ + .worktrees/index.json 重建现场。会话记忆是易失的; 磁盘状态是持久的。
+假设 Agent 跑到一半，Python 进程被 kill 了，内存里的 TASKS 和 WORKTREES 对象全没了。
+等下次重启，代码里的这两行会瞬间复活一切：
+    TASKS = TaskManager(REPO_ROOT / ".tasks")                    # 扫描 task_*.json
+    EVENTS = EventBus(REPO_ROOT / ".worktrees" / "events.jsonl") # 追加日志
+    # WorktreeManager 初始化时读 index.json
 
-Key insight: "The agent finds work itself."
+Key insight: "Isolate by directory, coordinate by task ID."
 """
 
 import json
@@ -62,6 +75,35 @@ THRESHOLD = 50000
 KEEP_RECENT = 3
 POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
+
+
+def detect_repo_root(cwd: Path) -> Path | None:
+    """Return git repo root if cwd is inside a repo, else None.
+       如果cwd在repo中，则返回git repo根，否则返回 None。         """
+    try:
+        # 调用 git 命令获取当前目录所属的仓库根路径
+        # rev-parse --show-toplevel 是 Git 提供的标准获取根目录的命令
+        r = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,               # 以传入的当前工作目录作为基准去执行
+            capture_output=True,   # 捕获标准输出和标准错误，不打印到终端
+            text=True,             # 将输出的字节流自动解码为字符串
+            timeout=10,            # 设置 10 秒超时，防止 git 进程意外挂死
+        )
+        # 检查退出码：非 0 通常意味着当前目录不在任何 git 仓库内
+        if r.returncode != 0:
+            return None
+        # 取出输出结果，strip() 去掉末尾的换行符，并转为 Path 对象
+        root = Path(r.stdout.strip())
+        # 防御性检查：确保这个路径在磁盘上真实存在，存在才返回
+        return root if root.exists() else None
+    except Exception:
+        # 兜底处理：如果系统没装 git (抛出 FileNotFoundError) 或权限不足等任何异常
+        # 统一静默捕获，返回 None，保证 Agent 启动不会因为环境问题直接崩溃
+        return None
+
+REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR
+
 
 # %% ------------ MessageBus and TeammateManager ------------
 
@@ -516,6 +558,77 @@ class TeammateManager:
 TEAM = TeammateManager(TEAM_DIR)
 
 
+# %% -- EventBus: append-only lifecycle events for observability --
+# 追加写入的生命周期事件总线，用于系统状态的可观测性。
+# "append-only" 意味着只会往文件末尾加新内容，永远不会修改或删除历史内容。
+class EventBus:
+    def __init__(self, event_log_path: Path):
+        # 将传入的事件日志文件路径（如 .worktrees/events.jsonl）保存为实例变量
+        self.path = event_log_path
+        # 确保日志文件的父目录（.worktrees/）存在。
+        # parents=True 允许创建多级目录，exist_ok=True 表示如果目录已存在不报错。
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # 如果日志文件不存在，则创建一个空文件。
+        # 这是为了防止后续使用 "a" 模式追加写入时，因文件不存在而报错。
+        if not self.path.exists():
+            self.path.write_text("")
+
+    def emit(
+        self,
+        event: str,
+        task: dict | None = None,
+        worktree: dict | None = None,
+        error: str | None = None,
+    ):
+        # 构建要写入文件的事件数据字典（负载）
+        payload = {
+            "event": event,             # 事件名称，如 "worktree.create.after"
+            "ts": time.time(),          # 时间戳，记录事件发生的精确 Unix 时间（浮点数秒）
+            "task": task or {},         # 关联的任务信息。如果传入了 task 字典则使用，否则给个空字典防 None
+            "worktree": worktree or {}, # 关联的工作树信息。逻辑同上
+        }
+        # 如果调用时传入了 error 字符串，说明是异常事件，将其加入 payload
+        if error:
+            payload["error"] = error
+        
+        # 打开文件并写入。模式 "a" 代表 append（追加模式）。
+        # 技术细节：追加模式在操作系统层面会将文件指针移到末尾，即使在多线程/多进程并发写入时，
+        # 只要单次写入的字节数不超过系统管道缓冲区（通常几KB），就不会发生内容交叉覆盖。
+        # encoding="utf-8" 确保中文等字符不会乱码。
+        with self.path.open("a", encoding="utf-8") as f:
+            # 将 payload 字典序列化为 JSON 字符串，并加上换行符 "\n"。
+            # 这就是 JSONL（JSON Lines）格式：每行是一个独立的 JSON 对象，方便按行读取和解析。
+            f.write(json.dumps(payload) + "\n")
+
+    def list_recent(self, limit: int = 20) -> str:
+        # 边界值安全处理：将 limit 限制在 1 到 200 之间。
+        # 防止外部传入负数、0 或极大的数字（如 100000）导致后续切片异常或内存溢出。
+        n = max(1, min(int(limit or 20), 200))
+        
+        # 读取整个日志文件内容，并按换行符拆分成列表。
+        # 技术局限：当日志文件极大时（如几百MB），这种全量读取会占用较多内存。
+        # 但在 Agent 的单次会话场景下，日志量通常很小，这种实现最简单可靠。
+        lines = self.path.read_text(encoding="utf-8").splitlines()
+        
+        # 使用 Python 切片特性 [-n:]，获取列表最后 n 个元素（即最近的 n 行日志）
+        recent = lines[-n:]
+        
+        items = []
+        # 遍历这几行日志字符串
+        for line in recent:
+            try:
+                # 尝试将每行字符串反序列化为 Python 字典，加入结果列表
+                items.append(json.loads(line))
+            except Exception:
+                # 防御性编程：如果某一行日志被意外截断或损坏（不是合法 JSON），
+                # 不抛出异常中断程序，而是将其包装成一个特殊的错误字典，保留原始文本供排查。
+                items.append({"event": "parse_error", "raw": line})
+        
+        # 将解析后的字典列表，格式化输出为带缩进的 JSON 字符串返回给 Agent 阅读
+        return json.dumps(items, indent=2)
+
+EVENTS = EventBus(REPO_ROOT / ".worktrees" / "events.jsonl")
+
 # %% -- TaskManager: CRUD with dependency graph, persisted as JSON files --
 class TaskManager:
     # TaskManager 类：用于管理任务的完整工具箱
@@ -524,7 +637,7 @@ class TaskManager:
     def __init__(self, tasks_dir: Path):
         self.dir = tasks_dir
         # 把传入的目录路径保存为实例属性，之后所有方法都通过 self.dir 访问它
-        self.dir.mkdir(exist_ok=True)
+        self.dir.mkdir(parents=True, exist_ok=True)
         # 创建该目录。exist_ok=True 表示"如果目录已存在就不报错，直接跳过"
         self._next_id = self._max_id() + 1
         # 调用 _max_id() 找出当前已有任务中最大的 ID，再加 1，作为下一个新任务的 ID
@@ -535,31 +648,27 @@ class TaskManager:
 
     def _max_id(self) -> int:
         # 扫描任务目录，找出已有任务文件中最大的任务 ID
-
-        ids = [int(f.stem.split("_")[1]) for f in self.dir.glob("task_*.json")]
-        # 这是一个列表推导式，等价于一个 for 循环，逐步拆解：
-        #   self.dir.glob("task_*.json")
-        #     → 找出目录下所有文件名匹配 "task_*.json" 的文件，* 是通配符
-        #     → 例如找到：task_1.json, task_3.json, task_5.json
-        #   f.stem
-        #     → 取文件名（不含扩展名），如 "task_3.json" 的 stem 是 "task_3"
-        #   .split("_")[1]
-        #     → 按下划线切割字符串，"task_3" → ["task", "3"]，取索引1即 "3"
-        #   int(...)
-        #     → 把字符串 "3" 转成整数 3
-        # 最终 ids 是所有任务 ID 的整数列表，如 [1, 3, 5]
+        ids = []
+        for f in self.dir.glob("task_*.json"):
+            try:
+                ids.append(int(f.stem.split("_")[1]))
+            except Exception:
+                pass
         return max(ids) if ids else 0
-        # 如果 ids 不为空，返回最大值；如果目录里没有任务文件，ids 是空列表，返回 0
+
+
+
+    def _path(self, task_id: int) -> Path:
+        return self.dir / f"task_{task_id}.json"
+        # Path 对象支持用 / 拼接路径（比字符串拼接更安全跨平台）
+        # f"task_{task_id}.json" 是 f-string，会把变量 task_id 插入字符串
+        # 例如 task_id=3 → path 是 "tasks/task_3.json"
 
 
 
     def _load(self, task_id: int) -> dict:
         # 根据任务 ID 从磁盘读取对应的 JSON 文件，返回字典
-
-        path = self.dir / f"task_{task_id}.json"
-        # Path 对象支持用 / 拼接路径（比字符串拼接更安全跨平台）
-        # f"task_{task_id}.json" 是 f-string，会把变量 task_id 插入字符串
-        # 例如 task_id=3 → path 是 "tasks/task_3.json"
+        path = self._path(task_id)
         if not path.exists():
             raise ValueError(f"Task {task_id} not found")
         # 检查文件是否存在，如果不存在就抛出 ValueError 异常，终止程序并提示错误信息
@@ -571,8 +680,7 @@ class TaskManager:
 
     def _save(self, task: dict):
         # 把一个任务字典写入磁盘对应的 JSON 文件
-
-        path = self.dir / f"task_{task['id']}.json"
+        path = self._path(task['id'])
         # 根据任务字典里的 id 字段构造文件路径
         path.write_text(json.dumps(task, indent=2, ensure_ascii=False))
         # json.dumps(task, ...) → 把 Python 字典转成 JSON 格式的字符串
@@ -586,7 +694,6 @@ class TaskManager:
         # 创建一个新任务并保存，返回该任务的 JSON 字符串
         # subject: str      → 任务标题，必填
         # description: str = "" → 任务描述，选填，默认为空字符串
-
         task = {
             "id": self._next_id,         # 分配当前可用的 ID
             "subject": subject,           # 任务标题
@@ -594,6 +701,10 @@ class TaskManager:
             "status": "pending",          # 初始状态固定为 "pending"（待处理）
             "blockedBy": [],              # 阻塞依赖列表，初始为空（没有前置任务）
             "owner": "",                  # 负责人，初始为空
+            "worktree": "",
+            "blockedBy": [],
+            "created_at": time.time(),
+            "updated_at": time.time(),
         } # 构造一个新任务字典，包含所有字段的初始值
         self._save(task)
         # 把新任务写入磁盘
@@ -606,17 +717,18 @@ class TaskManager:
 
     def get(self, task_id: int) -> str:
         # 根据 ID 查询单个任务，返回格式化 JSON 字符串
-
         return json.dumps(self._load(task_id), indent=2, ensure_ascii=False)
         # _load() 从磁盘读取任务字典，json.dumps() 再转回格式化字符串返回
         # 看起来多此一举，但统一了返回格式，外部调用者总是拿到字符串
 
 
+    def exists(self, task_id: int) -> bool:
+        return self._path(task_id).exists()
 
-    def update(self, task_id: int, status: str = None,
+
+    def update(self, task_id: int, status: str = None, owner: str = None,
                add_blocked_by: list = None, remove_blocked_by: list = None) -> str:
         # 更新一个已有任务的状态或依赖关系. 所有参数都有默认值 None，表示"不传就不修改该字段"
-
         task = self._load(task_id)
         # 先从磁盘读取现有数据(以字典形式)，避免覆盖未修改的字段
         if status:
@@ -635,6 +747,9 @@ class TaskManager:
         if remove_blocked_by:
             # 如果传入了需要移除的依赖 ID 列表
             task["blockedBy"] = [x for x in task["blockedBy"] if x not in remove_blocked_by]
+        if owner is not None:
+            task["owner"] = owner
+        task["updated_at"] = time.time()        
         self._save(task) # 把修改后的任务字典写回磁盘
         return json.dumps(task, indent=2, ensure_ascii=False) # 返回更新后的任务 JSON 字符串
 
@@ -655,13 +770,64 @@ class TaskManager:
 
 
 
+    def bind_worktree(self, task_id: int, worktree: str, owner: str = "") -> str:
+        """
+        将任务与 Worktree 进行双向绑定。
+        这是 s12 架构的核心：一旦绑定，任务状态自动流转为 'in_progress'。
+        """
+        # 加载任务数据：从 .tasks/task_<id>.json 读取当前任务信息
+        task = self._load(task_id)
+        
+        # 建立关联：在任务记录中写入绑定的 worktree 名称
+        # 这样任务就知道自己“在哪做”了
+        task["worktree"] = worktree
+        
+        if owner:
+            task["owner"] = owner
+
+        # 状态机流转：
+        # 如果任务当前是 'pending'（待办），绑定工作树意味着开始干活了
+        # 所以自动将状态推进到 'in_progress'（进行中）
+        if task.get("status") == "pending":
+            task["status"] = "in_progress"
+
+        # 更新时间戳：记录最后一次修改的时间，用于调试和排序
+        task["updated_at"] = time.time()
+            
+        # 5. 持久化：将更新后的任务数据写回磁盘
+        self._save(task)
+        
+        # 6. 返回结果：返回更新后的任务 JSON 字符串，供调用者确认
+        return json.dumps(task, indent=2)
+
+    def unbind_worktree(self, task_id: int) -> str:
+        """
+        解除任务与 Worktree 的绑定。
+        通常在 Worktree 被删除（remove）时调用，用于清理任务状态。
+        """
+        # 1. 加载任务数据：读取当前任务信息
+        task = self._load(task_id)
+        
+        # 2. 清除关联：将 worktree 字段置为空字符串
+        # 表示该任务不再关联任何执行环境
+        task["worktree"] = ""
+        
+        # 3. 更新时间戳
+        task["updated_at"] = time.time()
+        
+        # 4. 持久化：保存更改到磁盘
+        self._save(task)
+        
+        # 5. 返回结果：返回更新后的任务 JSON 字符串
+        return json.dumps(task, indent=2)
+
+
+
     def list_all(self) -> str:
         # 列出所有任务，返回格式化的文本摘要
-
         tasks = []
         # 初始化一个空列表，用来收集所有任务字典
-        files = sorted(self.dir.glob("task_*.json"),
-            key=lambda f: int(f.stem.split("_")[1]))
+        files = sorted(self.dir.glob("task_*.json"), key=lambda f: int(f.stem.split("_")[1]))
         # 获取所有任务文件，并按任务 ID 从小到大排序
         # sorted(..., key=...) → 按 key 函数的返回值排序
         # lambda f: int(f.stem.split("_")[1])
@@ -684,10 +850,12 @@ class TaskManager:
             #   "in_progress" → "[>]"  （进行中，箭头）
             #   "completed"   → "[x]"  （已完成，打叉）
             # .get(t["status"], "[?]") → 如果状态不在字典中，返回 "[?]" 作为默认值
+            owner = f" owner={t['owner']}" if t.get("owner") else ""
+            wt = f" wt={t['worktree']}" if t.get("worktree") else ""
             blocked = f" (blocked by: {t['blockedBy']})" if t.get("blockedBy") else ""
             # 如果任务有依赖（blockedBy 不为空列表），生成 " (blocked by: [1, 2])" 这样的附加信息
             # t.get("blockedBy") → 空列表 [] 在 Python 中是假值，所以没有依赖时 else 分支返回空字符串
-            lines.append(f"{marker} #{t['id']}: {t['subject']}{blocked}")
+            lines.append(f"{marker} #{t['id']}: {t['subject']}{owner}{blocked}{wt}")
             # 拼成一行，例如：
             #   "[ ] #1: 写周报"
             #   "[>] #2: 做 PPT (blocked by: [1])"
@@ -698,6 +866,324 @@ class TaskManager:
 
 
 TASKS = TaskManager(TASKS_DIR)
+
+
+# %% -- WorktreeManager: create/list/run/remove git worktrees + lifecycle index --
+class WorktreeManager:
+    def __init__(self, repo_root: Path, tasks: TaskManager, events: EventBus):
+        self.repo_root = repo_root # Git 仓库的根目录路径
+        self.tasks = tasks       # 任务管理器实例，用于绑定任务状态
+        self.events = events     # 事件总线实例，用于记录生命周期日志
+        self.dir = repo_root / ".worktrees" # 定义 worktree 的存储目录（在仓库根下）
+        self.dir.mkdir(parents=True, exist_ok=True) # 确保目录存在，不存在则创建
+        self.index_path = self.dir / "index.json" # 索引文件路径，用于持久化记录所有 worktree
+        # 初始化时检查当前目录是否为有效的 Git 仓库
+        # 如果不是仓库，后续的 git worktree 命令将不可用
+        if not self.index_path.exists():
+            self.index_path.write_text(json.dumps({"worktrees": []}, indent=2))
+        self.git_available = self._is_git_repo()
+
+    def _is_git_repo(self) -> bool:
+        """私有方法：检查是否在 Git 仓库中"""
+        try:
+            # 调用 git 命令检查是否在工作树内
+            # --is-inside-work-tree 如果在仓库内返回 0，否则报错
+            r = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                cwd=self.repo_root, # 在仓库根目录执行
+                capture_output=True, # 捕获输出
+                text=True, # 返回字符串
+                timeout=10,
+            )
+            # 如果命令执行成功（returncode == 0），说明是 Git 仓库
+            return r.returncode == 0
+        except Exception:
+            # 捕获所有异常（如未安装 Git），返回 False
+            return False
+
+    def _run_git(self, args: list[str]) -> str:
+        """私有方法：在仓库根目录运行 Git 命令"""
+        if not self.git_available:
+            # 如果检测到不是 Git 仓库，直接报错，防止误操作
+            raise RuntimeError("Not in a git repository. worktree tools require git.")
+            
+        # 执行 git 命令，传入 args 列表（例如 ["worktree", "add", ...]）
+        r = subprocess.run(
+            ["git", *args], # 拼接 git 和参数
+            cwd=self.repo_root, # 强制在仓库根目录执行，防止 cwd 错乱
+            capture_output=True,
+            text=True,
+            timeout=120, # 设置较长超时，因为 git 操作可能较慢
+        )
+        
+        # 检查命令是否执行失败
+        if r.returncode != 0:
+            # 如果失败，拼接 stdout 和 stderr 作为错误信息
+            msg = (r.stdout + r.stderr).strip()
+            # 抛出运行时错误，包含具体的 Git 错误信息
+            raise RuntimeError(msg or f"git {' '.join(args)} failed")
+            
+        # 命令成功，返回输出内容
+        return (r.stdout + r.stderr).strip() or "(no output)"
+
+    def _load_index(self) -> dict:
+        """私有方法：从磁盘加载索引文件"""
+        # 读取 JSON 文件并解析为字典
+        return json.loads(self.index_path.read_text())
+
+    def _save_index(self, data: dict):
+        """私有方法：将数据保存回索引文件"""
+        # 将字典写回 JSON 文件，格式化缩进以便人类阅读
+        self.index_path.write_text(json.dumps(data, indent=2))
+
+    def _find(self, name: str) -> dict | None:
+        """私有方法：根据名称在索引中查找 worktree 记录"""
+        idx = self._load_index() # 先加载索引
+        # 遍历索引中的 worktrees 列表
+        for wt in idx.get("worktrees", []):
+            if wt.get("name") == name: # 找到匹配名称的条目
+                return wt # 返回该条目
+        return None # 未找到返回 None
+
+    def _validate_name(self, name: str):
+        """私有方法：校验 worktree 名称的合法性"""
+        # 使用正则表达式限制名称格式：仅允许字母、数字、点、下划线、横线
+        # 长度 1-40 字符，防止路径注入或非法文件名
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", name or ""):
+            raise ValueError(
+                "Invalid worktree name. Use 1-40 chars: letters, numbers, ., _, -"
+            )
+
+    def create(self, name: str, task_id: int = None, base_ref: str = "HEAD") -> str:
+        """公开方法：创建一个新的 Git Worktree"""
+        self._validate_name(name) # 1. 校验名称
+        
+        # 2. 检查索引中是否已存在同名 worktree
+        if self._find(name):
+            raise ValueError(f"Worktree '{name}' already exists in index")
+            
+        # 3. 检查任务 ID 是否存在（如果提供了 task_id）
+        if task_id is not None and not self.tasks.exists(task_id):
+            raise ValueError(f"Task {task_id} not found")
+
+        # 4. 定义路径和分支名
+        # 物理路径：.worktrees/<name>
+        path = self.dir / name 
+        # Git 分支名：wt/<name> (命名空间隔离)
+        branch = f"wt/{name}" 
+
+        # 5. 发布事件：创建开始
+        self.events.emit(
+            "worktree.create.before",
+            task={"id": task_id} if task_id is not None else {},
+            worktree={"name": name, "base_ref": base_ref},
+        )
+        
+        try:
+            # 6. 执行 Git 命令创建
+            # git worktree add -b <branch> <path> <base_ref>
+            self._run_git(["worktree", "add", "-b", branch, str(path), base_ref])
+            
+            # 7. 构造索引条目
+            entry = {
+                "name": name,
+                "path": str(path), # 记录绝对路径（相对于 repo root）
+                "branch": branch,  # 记录对应的分支
+                "task_id": task_id, # 绑定的任务 ID
+                "status": "active", # 状态设为活跃
+                "created_at": time.time(), # 记录时间戳
+            }
+            
+            # 8. 更新索引文件
+            idx = self._load_index()
+            idx["worktrees"].append(entry) # 添加新条目
+            self._save_index(idx) # 保存文件
+
+            # 9. 如果绑定了任务，更新任务状态为 in_progress
+            if task_id is not None:
+                self.tasks.bind_worktree(task_id, name)
+
+            # 10. 发布事件：创建成功
+            self.events.emit(
+                "worktree.create.after",
+                task={"id": task_id} if task_id is not None else {},
+                worktree={ "name": name, "path": str(path), "branch": branch, "status": "active" },
+            )
+            
+            # 11. 返回创建的条目信息（JSON 字符串）
+            return json.dumps(entry, indent=2)
+            
+        except Exception as e:
+            # 12. 异常处理：记录失败事件并重新抛出异常
+            self.events.emit(
+                "worktree.create.failed",
+                task={"id": task_id} if task_id is not None else {},
+                worktree={"name": name, "base_ref": base_ref},
+                error=str(e),
+            )
+            raise
+
+    def list_all(self) -> str:
+        """公开方法：列出所有受管理的 worktree"""
+        idx = self._load_index()
+        wts = idx.get("worktrees", [])
+        if not wts:
+            return "No worktrees in index."
+            
+        lines = []
+        for wt in wts:
+            # 拼接状态、名称、路径、分支和关联的任务 ID
+            suffix = f" task={wt['task_id']}" if wt.get("task_id") else ""
+            lines.append(
+                f"[{wt.get('status', 'unknown')}] {wt['name']} -> "
+                f"{wt['path']} ({wt.get('branch', '-')}){suffix}"
+            )
+        return "\n".join(lines)
+
+    def status(self, name: str) -> str:
+        """公开方法：查看指定 worktree 的 Git 状态"""
+        wt = self._find(name) # 1. 查找
+        if not wt:
+            return f"Error: Unknown worktree '{name}'"
+            
+        path = Path(wt["path"])
+        if not path.exists():
+            return f"Error: Worktree path missing: {path}"
+            
+        # 2. 在 worktree 目录下执行 git status
+        r = subprocess.run(
+            ["git", "status", "--short", "--branch"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        text = (r.stdout + r.stderr).strip()
+        return text or "Clean worktree"
+
+    def run(self, name: str, command: str) -> str:
+        """公开方法：在指定 worktree 目录中运行 Shell 命令"""
+        # 1. 安全检查：拦截危险命令（rm -rf / 等）
+        dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
+        if any(d in command for d in dangerous):
+            return "Error: Dangerous command blocked"
+            
+        wt = self._find(name) # 2. 查找 worktree
+        if not wt:
+            return f"Error: Unknown worktree '{name}'"
+            
+        path = Path(wt["path"])
+        if not path.exists():
+            return f"Error: Worktree path missing: {path}"
+            
+        try:
+            # 3. 执行命令
+            # shell=True 允许执行复杂命令
+            # cwd=path 确保命令在隔离的 worktree 目录中运行
+            r = subprocess.run(
+                command,
+                shell=True,
+                cwd=path,
+                capture_output=True,
+                text=True,
+                timeout=300, # 5分钟超时
+            )
+            out = (r.stdout + r.stderr).strip()
+            # 4. 截断过长的输出，防止 Token 爆炸
+            return out[:50000] if out else "(no output)"
+        except subprocess.TimeoutExpired:
+            return "Error: Timeout (300s)"
+
+    def remove(self, name: str, force: bool = False, complete_task: bool = False) -> str:
+        """公开方法：移除 worktree（物理删除目录）"""
+        wt = self._find(name) # 1. 查找
+        if not wt:
+            return f"Error: Unknown worktree '{name}'"
+
+        # 2. 发布事件：移除开始
+        self.events.emit(
+            "worktree.remove.before",
+            task={"id": wt.get("task_id")} if wt.get("task_id") is not None else {},
+            worktree={"name": name, "path": wt.get("path")},
+        )
+        
+        try:
+            # 3. 构造 git worktree remove 命令参数
+            args = ["worktree", "remove"]
+            if force: # 是否强制删除（即使有未提交更改）
+                args.append("--force")
+            args.append(wt["path"]) # 指定要删除的路径
+            
+            self._run_git(args) # 执行删除
+
+            # 4. 如果设置了 complete_task，同时更新关联的任务状态
+            if complete_task and wt.get("task_id") is not None:
+                task_id = wt["task_id"]
+                before = json.loads(self.tasks.get(task_id)) # 获取旧状态用于日志
+                self.tasks.update(task_id, status="completed") # 标记任务完成
+                self.tasks.unbind_worktree(task_id) # 解绑 worktree
+                
+                # 发布任务完成事件
+                self.events.emit(
+                    "task.completed",
+                    task={ "id": task_id, "subject": before.get("subject", ""), "status": "completed" },
+                    worktree={"name": name},
+                )
+
+            # 5. 更新本地索引文件，标记状态为 removed
+            idx = self._load_index()
+            for item in idx.get("worktrees", []):
+                if item.get("name") == name:
+                    item["status"] = "removed"
+                    item["removed_at"] = time.time()
+            self._save_index(idx)
+
+            # 6. 发布事件：移除成功
+            self.events.emit(
+                "worktree.remove.after",
+                task={"id": wt.get("task_id")} if wt.get("task_id") is not None else {},
+                worktree={"name": name, "path": wt.get("path"), "status": "removed"},
+            )
+            return f"Removed worktree '{name}'"
+            
+        except Exception as e:
+            # 7. 异常处理
+            self.events.emit(
+                "worktree.remove.failed",
+                task={"id": wt.get("task_id")} if wt.get("task_id") is not None else {},
+                worktree={"name": name, "path": wt.get("path")},
+                error=str(e),
+            )
+            raise
+
+    def keep(self, name: str) -> str:
+        """公开方法：标记 worktree 为保留状态（不自动删除）"""
+        wt = self._find(name) # 1. 查找
+        if not wt:
+            return f"Error: Unknown worktree '{name}'"
+            
+        # 2. 更新索引中的状态为 'kept'
+        idx = self._load_index()
+        kept = None
+        for item in idx.get("worktrees", []):
+            if item.get("name") == name:
+                item["status"] = "kept"
+                item["kept_at"] = time.time()
+                kept = item
+        self._save_index(idx)
+
+        # 3. 发布保留事件
+        self.events.emit(
+            "worktree.keep",
+            task={"id": wt.get("task_id")} if wt.get("task_id") is not None else {},
+            worktree={ "name": name, "path": wt.get("path"), "status": "kept" },
+        )
+        
+        # 4. 返回结果
+        return json.dumps(kept, indent=2) if kept else f"Error: Unknown worktree '{name}'"
+
+WORKTREES = WorktreeManager(REPO_ROOT, TASKS, EVENTS)
+
 
 # %% -- SkillLoader: scan skills/<name>/SKILL.md with YAML frontmatter --
 class SkillLoader:
@@ -1297,7 +1783,7 @@ TOOLS = [
     {"name": "task_create", "description": "Create a new task.",
      "input_schema": {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, "required": ["subject"]}},
     {"name": "task_update", "description": "Update a task's status or dependencies.",
-     "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}, "addBlockedBy": {"type": "array", "items": {"type": "integer"}}, "removeBlockedBy": {"type": "array", "items": {"type": "integer"}}}, "required": ["task_id"]}},
+     "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}, "owner": {"type": "string"}, "addBlockedBy": {"type": "array", "items": {"type": "integer"}}, "removeBlockedBy": {"type": "array", "items": {"type": "integer"}}}, "required": ["task_id"]}},
     {"name": "task_list", "description": "List all tasks with status summary.",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "task_get", "description": "Get full details of a task by ID.",
@@ -1326,7 +1812,88 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "claim_task", "description": "Claim a task from the board by ID.",
      "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
-
+    {
+        "name": "task_bind_worktree",
+        "description": "Bind a task to a worktree name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "integer"},
+                "worktree": {"type": "string"},
+                "owner": {"type": "string"},
+            },
+            "required": ["task_id", "worktree"],
+        },
+    },
+    {
+        "name": "worktree_create",
+        "description": "Create a git worktree and optionally bind it to a task.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "task_id": {"type": "integer"},
+                "base_ref": {"type": "string"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "worktree_list",
+        "description": "List worktrees tracked in .worktrees/index.json.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "worktree_status",
+        "description": "Show git status for one worktree.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "worktree_run",
+        "description": "Run a shell command in a named worktree directory.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "command": {"type": "string"},
+            },
+            "required": ["name", "command"],
+        },
+    },
+    {
+        "name": "worktree_remove",
+        "description": "Remove a worktree and optionally mark its bound task completed.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "force": {"type": "boolean"},
+                "complete_task": {"type": "boolean"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "worktree_keep",
+        "description": "Mark a worktree as kept in lifecycle state without removing it.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "worktree_events",
+        "description": "List recent worktree/task lifecycle events from .worktrees/events.jsonl.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer"}},
+        },
+    },
 ]
 
 
@@ -1340,7 +1907,7 @@ TOOL_HANDLERS = {
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
     "compact":    lambda **kw: "Manual compression requested.",
     "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
-    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("addBlockedBy"), kw.get("removeBlockedBy")),
+    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("owner"), kw.get("addBlockedBy"), kw.get("removeBlockedBy")),
     "task_list":   lambda **kw: TASKS.list_all(),
     "task_get":    lambda **kw: TASKS.get(kw["task_id"]),
     "background_run":   lambda **kw: BG.run(kw["command"]),
@@ -1355,6 +1922,14 @@ TOOL_HANDLERS = {
     "plan_approval":     lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
     "idle":              lambda **kw: "Lead does not idle.",
     "claim_task":        lambda **kw: claim_task(kw["task_id"], "lead"),
+    "task_bind_worktree": lambda **kw: TASKS.bind_worktree(kw["task_id"], kw["worktree"], kw.get("owner", "")),
+    "worktree_create": lambda **kw: WORKTREES.create(kw["name"], kw.get("task_id"), kw.get("base_ref", "HEAD")),
+    "worktree_list": lambda **kw: WORKTREES.list_all(),
+    "worktree_status": lambda **kw: WORKTREES.status(kw["name"]),
+    "worktree_run": lambda **kw: WORKTREES.run(kw["name"], kw["command"]),
+    "worktree_keep": lambda **kw: WORKTREES.keep(kw["name"]),
+    "worktree_remove": lambda **kw: WORKTREES.remove(kw["name"], kw.get("force", False), kw.get("complete_task", False)),
+    "worktree_events": lambda **kw: EVENTS.list_recent(kw.get("limit", 20)),
 }
 
 # 系统提示词
@@ -1363,8 +1938,10 @@ You are a coding agent and a team lead at {WORKDIR} on a Windows Operating Syste
 Planning: 
           Use the todo tool to plan multi-step tasks (mark as in_progress when starting, completed when done). 
           Important: Don't use todo tool easily. Todo is only used for complex tasks that may have five or more steps.
-          Use the task tool to delegate exploration or subtasks. 
           Use background_run for long-running commands.
+          Use task + worktree tools for multi-task work.
+          For parallel or risky changes: create tasks, allocate worktree lanes, run commands in those lanes, then choose keep/remove for closeout.
+          Use worktree_events when you need lifecycle visibility.
 Knowledge: Use load_skill to access specialized knowledge for unfamiliar topics. Available skills: {SKILL_LOADER.get_descriptions()}.
 Multi-Agent:
           Spawn teammates and communicate via inboxes. 
@@ -1473,6 +2050,13 @@ def agent_loop(messages: list):
 
 # %% ---------------- main ----------------
 if __name__ == "__main__":
+
+    # TODO:<<<< worktree worktree ----
+    print(f"Repo root for s12: {REPO_ROOT}")
+    if not WORKTREES.git_available:
+        print("Note: Not in a git repo. worktree_* tools will return errors.")
+    # TODO:---- worktree worktree >>>>
+
     history = []
     while True:
         try:
