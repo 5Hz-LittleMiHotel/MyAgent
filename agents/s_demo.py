@@ -112,6 +112,7 @@ VALID_MSG_TYPES = {
     "broadcast",
     "shutdown_request",
     "shutdown_response",
+    "plan_approval_request",
     "plan_approval_response",
 }
 
@@ -127,6 +128,10 @@ class MessageBus:
     def __init__(self, inbox_dir: Path):
         # 收件箱目录（每个成员一个 .jsonl 文件）
         self.dir = inbox_dir
+        # FIX: MessageBus inbox drain lock
+        # send() 和 read_inbox() 必须共用这把锁；否则消息可能刚好
+        # 追加在 read_text() 和 write_text("") 之间，然后被清空覆盖。
+        self._inbox_lock = threading.Lock()
         # 创建目录（如果不存在）
         self.dir.mkdir(parents=True, exist_ok=True)
 
@@ -149,8 +154,9 @@ class MessageBus:
         # 收件箱路径（每个用户一个文件）
         inbox_path = self.dir / f"{to}.jsonl"
         # 以追加方式写入一行JSON（JSONL格式）
-        with open(inbox_path, "a") as f:
-            f.write(json.dumps(msg) + "\n")
+        with self._inbox_lock:
+            with open(inbox_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
         return f"Sent {msg_type} to {to}"
     
 
@@ -162,13 +168,15 @@ class MessageBus:
         # 如果文件不存在，说明没有消息
         if not inbox_path.exists():
             return []
-        messages = []
-        # 逐行读取JSONL文件
-        for line in inbox_path.read_text().strip().splitlines():
-            if line:
-                messages.append(json.loads(line))  # 反序列化为字典
-        # 读取后清空收件箱（“消费”模式）
-        inbox_path.write_text("")
+        with self._inbox_lock:
+            messages = []
+            # FIX: MessageBus atomic in-process drain
+            # 读取和清空必须和 send() 互斥，避免读后清空覆盖新追加消息。
+            for line in inbox_path.read_text(encoding="utf-8").strip().splitlines():
+                if line:
+                    messages.append(json.loads(line))  # 反序列化为字典
+            # 读取后清空收件箱（“消费”模式）
+            inbox_path.write_text("", encoding="utf-8")
         return messages
 
 
@@ -275,6 +283,84 @@ class TeammateManager:
             member["status"] = status
             self._save_config()
 
+    def _set_plan_waiting(self, name: str, request_id: str, plan_text: str):
+        # FIX: persistent plan approval state machine
+        # Persist the approval gate so a teammate cannot keep executing after
+        # submitting a plan, and so /team can show what it is waiting on.
+        member = self._find_member(name)
+        if member:
+            member["status"] = "waiting_approval"
+            member["pending_plan_request_id"] = request_id
+            member["pending_plan"] = plan_text
+            self._save_config()
+
+    def _clear_plan_waiting(self, name: str, status: str = "idle"):
+        # FIX: persistent plan approval state machine
+        # Approval/rejection clears the pending fields; the teammate returns to
+        # idle until its loop resumes actual work.
+        member = self._find_member(name)
+        if member:
+            member["status"] = status
+            member.pop("pending_plan_request_id", None)
+            member.pop("pending_plan", None)
+            self._save_config()
+
+    def _is_waiting_approval(self, name: str) -> bool:
+        member = self._find_member(name)
+        return bool(member and member.get("status") == "waiting_approval")
+
+    def _find_pending_plan_request(self, request_id: str) -> dict | None:
+        # FIX: Recover pending plan approvals from persisted teammate config after restart.
+        for member in self.config.get("members", []):
+            if member.get("pending_plan_request_id") == request_id:
+                return {
+                    "from": member.get("name", ""),
+                    "plan": member.get("pending_plan", ""),
+                    "status": "pending",
+                }
+        return None
+
+    def _handle_plan_approval_response(self, name: str, msg: dict) -> str:
+        # FIX: teammate consumes plan approval replies
+        # Treat approval responses as protocol messages, not ordinary chat.
+        member = self._find_member(name)
+        if not member:
+            return json.dumps(msg)
+        expected = member.get("pending_plan_request_id")
+        req_id = msg.get("request_id", "")
+        if expected and req_id != expected:
+            return (
+                f"<plan_approval_ignored request_id=\"{req_id}\" "
+                f"expected=\"{expected}\">Mismatched approval response.</plan_approval_ignored>"
+            )
+        approve = bool(msg.get("approve"))
+        feedback = msg.get("feedback", "")
+        self._clear_plan_waiting(name, "idle")
+        if approve:
+            return (
+                f"<plan_approved request_id=\"{req_id}\">"
+                f"You may proceed with the approved plan.</plan_approved>"
+            )
+        return (
+            f"<plan_rejected request_id=\"{req_id}\">"
+            f"Feedback: {feedback}\nRevise your plan before doing major work."
+            f"</plan_rejected>"
+        )
+
+    def _drain_protocol_inbox(self, name: str, messages: list) -> list:
+        # FIX: teammate inbox protocol handling
+        # Approval replies update the persisted gate before the LLM sees them.
+        inbox = BUS.read_inbox(name)
+        for msg in inbox:
+            if msg.get("type") == "plan_approval_response":
+                messages.append({
+                    "role": "user",
+                    "content": self._handle_plan_approval_response(name, msg),
+                })
+            else:
+                messages.append({"role": "user", "content": json.dumps(msg)})
+        return inbox
+
     # 新建或征用一个子智能体，修改名单中的状态并运行它的loop
     def spawn(self, name: str, role: str, prompt: str) -> str:
         # 查找是否已有该成员
@@ -324,11 +410,10 @@ class TeammateManager:
         while True:
             # 最多执行50轮（防止无限循环）
             for _ in range(50):
-                # 读取收件箱消息
-                inbox = BUS.read_inbox(name)
-                # 将消息加入上下文
-                for msg in inbox:
-                    messages.append({"role": "user", "content": json.dumps(msg)})
+                # FIX: teammate inbox protocol handling
+                # Approval responses are consumed by the state machine before
+                # ordinary messages are appended to model context.
+                self._drain_protocol_inbox(name, messages)
                 # 检查旗帜，真正的退出
                 if should_exit:
                     self._set_status(name, "shutdown")
@@ -370,13 +455,17 @@ class TeammateManager:
                         # 改变 should_exit 旗杆状态
                         if block.name == "shutdown_response" and block.input.get("approve"):
                             should_exit = True
+                        if block.name == "plan_approval" and self._is_waiting_approval(name):
+                            # FIX: Stop the work loop immediately after submitting a plan.
+                            idle_requested = True
                 # 将工具结果作为用户消息喂回模型（继续对话）
                 messages.append({"role": "user", "content": results})
                 if idle_requested:
                     break
             
             # -- IDLE PHASE: poll for inbox messages and unclaimed tasks --
-            self._set_status(name, "idle") # 50轮结束自动进入idle
+            if not self._is_waiting_approval(name):
+                self._set_status(name, "idle") # 50轮结束自动进入idle
             resume = False # 初始化恢复标志：默认假设无任务不工作
             polls = IDLE_TIMEOUT // max(POLL_INTERVAL, 1) # 计算最大轮询次数
             for _ in range(polls): # 进入轮询循环
@@ -384,8 +473,31 @@ class TeammateManager:
                 inbox = BUS.read_inbox(name) # --- 检查点 A：有没有消息
                 if inbox: # 如果有消息，遍历处理
                     for msg in inbox:
+                        if msg.get("type") == "plan_approval_response":
+                            # FIX: teammate consumes plan approval replies
+                            messages.append({
+                                "role": "user",
+                                "content": self._handle_plan_approval_response(name, msg),
+                            })
+                            continue
                         # 特殊情况：如果是关机指令，强制退出
                         if msg.get("type") == "shutdown_request":
+                            # FIX: idle shutdown acknowledgement
+                            # Even while idle, keep the shutdown protocol consistent:
+                            # update the lead-side tracker and send a shutdown_response
+                            # before the teammate exits.
+                            req_id = msg.get("request_id", "")
+                            if req_id:
+                                with _tracker_lock:
+                                    if req_id in shutdown_requests:
+                                        shutdown_requests[req_id]["status"] = "approved"
+                            BUS.send(
+                                name,
+                                "lead",
+                                "Idle shutdown acknowledged.",
+                                "shutdown_response",
+                                {"request_id": req_id, "approve": True},
+                            )
                             self._set_status(name, "shutdown")
                             return
                         # 普通消息：将 JSON 格式的消息转为字符串，加入上下文
@@ -393,6 +505,11 @@ class TeammateManager:
                     # 有消息处理，设置标志位并跳出轮询，回到 WORK 阶段
                     resume = True
                     break
+                if self._is_waiting_approval(name):
+                    # FIX: plan approval wait loop
+                    # While approval is pending, do not auto-claim unrelated
+                    # tasks and do not leave the waiting state.
+                    continue
                 # --- 检查点 B：有没有未认领的任务（sort过取第一个可用任务）
                 unclaimed = scan_unclaimed_tasks()
                 if unclaimed:
@@ -423,6 +540,11 @@ class TeammateManager:
             # --- 超时处理 ---
             # 如果 for 循环跑完了（12次都检查了），resume 还是 False，说明既没消息也没任务，等了60秒
             if not resume:
+                if self._is_waiting_approval(name):
+                    # FIX: plan approval wait loop
+                    # Keep polling for lead approval instead of timing out to
+                    # shutdown while the persisted gate is still active.
+                    continue
                 self._set_status(name, "shutdown")
                 return
             # --- 恢复工作 ---
@@ -434,6 +556,19 @@ class TeammateManager:
     # 子智能体的Handler
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
         # 执行不同工具（调度层）
+
+        safe_while_waiting = {"read_inbox", "send_message", "idle", "task_get"}
+        if self._is_waiting_approval(sender) and tool_name not in safe_while_waiting:
+            # FIX: plan approval execution gate
+            # Once a plan is submitted, block mutating/active tools until the
+            # lead's plan_approval_response clears the persisted gate.
+            member = self._find_member(sender) or {}
+            req_id = member.get("pending_plan_request_id", "")
+            return (
+                "Error: waiting for plan approval"
+                f"{f' (request_id={req_id})' if req_id else ''}; "
+                "only read_inbox, send_message, idle, and task_get are allowed."
+            )
 
         if tool_name == "bash":
             return _run_bash(args["command"])
@@ -451,7 +586,16 @@ class TeammateManager:
                 args.get("msg_type", "message")
             )
         if tool_name == "read_inbox":
-            return json.dumps(BUS.read_inbox(sender), indent=2)
+            inbox = BUS.read_inbox(sender)
+            processed = []
+            for msg in inbox:
+                if msg.get("type") == "plan_approval_response":
+                    processed.append(self._handle_plan_approval_response(sender, msg))
+                else:
+                    processed.append(msg)
+            return json.dumps(processed, indent=2, ensure_ascii=False)
+        if tool_name == "task_get":
+            return TASKS.get(args["task_id"])
         if tool_name == "shutdown_response":
         # ==========================================
         # 协议 1 处理：关机响应
@@ -492,12 +636,13 @@ class TeammateManager:
             with _tracker_lock:
                 # 在 Tracker 中为这个新计划开一个房间，初始状态强制设为 pending
                 plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending"}
+            self._set_plan_waiting(sender, req_id, plan_text)
             
             # 通过消息总线把计划内容和 req_id 打包发送给 Lead 进行审查
             BUS.send(
                 sender, "lead", 
                 plan_text,                   # 计划正文作为消息内容发给 Lead 看
-                "plan_approval_response",    # 消息类型标识（注：这个名字在 Lead 那边会触发对应的审查逻辑）
+                "plan_approval_request",     # FIX: clearer plan approval message naming
                 {"request_id": req_id, "plan": plan_text}, # 结构化载荷
             )
             # 返回结果给 Teammate 的 LLM，告诉它计划已提交，必须停下来等待 Lead 的批复
@@ -530,6 +675,12 @@ class TeammateManager:
             {"name": "read_inbox", "description": "Read and drain your inbox.",
              "input_schema": {"type": "object", "properties": {}}},
 
+            {"name": "idle", "description": "Enter idle polling while waiting for messages or tasks.",
+             "input_schema": {"type": "object", "properties": {}}},
+
+            {"name": "task_get", "description": "Read-only: get full details of a task by ID.",
+             "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
+
             {"name": "shutdown_response", "description": "Respond to a shutdown request. Approve to shut down, reject to keep working.",
              "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["request_id", "approve"]}},
 
@@ -546,7 +697,11 @@ class TeammateManager:
             return "No teammates."
         lines = [f"Team: {self.config['team_name']}"]
         for m in self.config["members"]:
-            lines.append(f"  {m['name']} ({m['role']}): {m['status']}")
+            pending = ""
+            if m.get("pending_plan_request_id"):
+                # FIX: visible persistent plan approval state
+                pending = f" waiting_for_plan={m['pending_plan_request_id']}"
+            lines.append(f"  {m['name']} ({m['role']}): {m['status']}{pending}")
         return "\n".join(lines)
 
     # 返回所有成员名字列表，主智能体调用 broadcast 时作为参数
@@ -1740,7 +1895,12 @@ def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> st
     with _tracker_lock:
         req = plan_requests.get(request_id)
     if not req:
-        return f"Error: Unknown plan request_id '{request_id}'"
+        # FIX: Rebuild missing in-memory plan request from persisted waiting state.
+        req = TEAM._find_pending_plan_request(request_id)
+        if not req:
+            return f"Error: Unknown plan request_id '{request_id}'"
+        with _tracker_lock:
+            plan_requests[request_id] = req
     with _tracker_lock:
         req["status"] = "approved" if approve else "rejected"
     BUS.send(
