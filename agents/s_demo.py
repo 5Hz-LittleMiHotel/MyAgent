@@ -1693,6 +1693,10 @@ class TodoManager:
         lines.append(f"({done}/{len(self.items)} completed)")
         return "\n".join(lines)
 
+    def has_open_items(self) -> bool:
+        # FIX: remind only after todo workflow exists and still has unfinished items
+        return any(item.get("status") != "completed" for item in self.items)
+
 TODO = TodoManager()
 
 
@@ -2192,8 +2196,10 @@ def agent_loop(messages: list):
                     used_todo = True
         # 模型连续 3 轮以上不调用 todo 时注入提醒。
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-        if rounds_since_todo >= 3:
+        # FIX: remind only after todo workflow exists and still has unfinished items
+        if TODO.has_open_items() and rounds_since_todo >= 3:
             results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
+            rounds_since_todo = 0
         # TODO:---------------------- todo >>>>>>>>>>>>>>>>>>>>>>>
 
         # 把工具执行结果作为“用户消息”喂回模型
@@ -2233,19 +2239,10 @@ if __name__ == "__main__":
         if query.strip() == "/inbox":
             print(json.dumps(BUS.read_inbox("lead"), indent=2))
             continue
-            # 检查用户输入的指令是否为 "/tasks" (这是一个查看任务看板的特殊指令，不需要发给 LLM 处理)
+        # 检查用户输入的指令是否为 "/tasks" (这是一个查看任务看板的特殊指令，不需要发给 LLM 处理)
         if query.strip() == "/tasks":
-            TASKS_DIR.mkdir(exist_ok=True)
-            for f in sorted(TASKS_DIR.glob("task_*.json")):
-                t = json.loads(f.read_text())
-                # 根据任务状态获取对应的视觉标记 ([ ] [>] [x])
-                marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(t["status"], "[?]")
-                # 如果任务有归属者，则将其格式化为 " @名字" (例如 @alice)，否则为空字符串
-                owner = f" @{t['owner']}" if t.get("owner") else ""
-                # 在控制台打印出格式化后的任务信息
-                # 示例输出: [ ] #5: Fix bug @alice
-                print(f"  {marker} #{t['id']}: {t['subject']}{owner}")
-                continue
+            print(TASKS.list_all())
+            continue
         # TODO:---- agent_teams:Command-line Debugger >>>>
 
         history.append({"role": "user","content": query})
