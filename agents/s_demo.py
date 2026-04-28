@@ -1,53 +1,3 @@
-#!/usr/bin/env python3
-# Harness: directory isolation -- parallel execution lanes that never collide.
-"""
-s12_worktree_task_isolation.py - Worktree + Task Isolation
-                                   工作树 + 任务隔离
-Directory-level isolation for parallel task execution.
-并行任务执行的目录级隔离。
-Tasks are the control plane and worktrees are the execution plane.
-任务是控制平面，工作树是执行平面。
-
-    一个任务一个文件（One-file-per-task）：
-    .tasks/task_12.json
-      {
-        "id": 12,
-        "subject": "Implement auth refactor",
-        "status": "in_progress",
-        "worktree": "auth-refactor"
-      }
-      id, subject, status, owner: 业务状态（我们要做什么？做到哪了？谁负责？）。
-      worktree: "auth-refactor" （关键点！）：注意，这里存的是 name（名字），而不是 path（路径）。
-      这是一种极好的解耦。任务不需要知道 worktree 藏在 .worktrees/ 下面多深，也不需要知道 Git 分支叫什么。
-      它只记住：“我绑定了一个叫 auth-refactor 的执行环境。”
-
-    单一索引文件：
-    .worktrees/index.json
-      {
-        "worktrees": [
-          {
-            "name": "auth-refactor",
-            "path": ".../.worktrees/auth-refactor",
-            "branch": "wt/auth-refactor",
-            "task_id": 12,
-            "status": "active"
-          }
-        ]
-      }
-      name, path, branch: 这是纯粹的物理实现细节（在哪？基于什么分支拉出来的？）。
-      task_id: 12 （关键点！）：这是反向指针，指回控制面。
-
-两个文件双向绑定。
-崩溃后从 .tasks/ + .worktrees/index.json 重建现场。会话记忆是易失的; 磁盘状态是持久的。
-假设 Agent 跑到一半，Python 进程被 kill 了，内存里的 TASKS 和 WORKTREES 对象全没了。
-等下次重启，代码里的这两行会瞬间复活一切：
-    TASKS = TaskManager(REPO_ROOT / ".tasks")                    # 扫描 task_*.json
-    EVENTS = EventBus(REPO_ROOT / ".worktrees" / "events.jsonl") # 追加日志
-    # WorktreeManager 初始化时读 index.json
-
-Key insight: "Isolate by directory, coordinate by task ID."
-"""
-
 import json
 import os
 import re
@@ -857,7 +807,6 @@ class TaskManager:
             "blockedBy": [],              # 阻塞依赖列表，初始为空（没有前置任务）
             "owner": "",                  # 负责人，初始为空
             "worktree": "",
-            "blockedBy": [],
             "created_at": time.time(),
             "updated_at": time.time(),
         } # 构造一个新任务字典，包含所有字段的初始值
